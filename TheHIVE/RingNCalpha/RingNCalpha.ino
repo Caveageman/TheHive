@@ -6,6 +6,9 @@
 #include <FastLED.h> 
 #include "SwarmProtocol.h" 
 
+// Compile-time sanity check for ESP-NOW payload size
+static_assert(sizeof(SwarmMessage) <= 250, "SwarmMessage exceeds ESP-NOW payload size");
+
 // ======================
 // 🛠️ HARDWARE PINS (QUEEN NODE)
 // ======================
@@ -63,6 +66,9 @@ SwarmMessage incomingMsg;
 volatile bool msgReceived = false;
 volatile int rawPacketCount = 0; 
 
+// Activity snapshot (thread-safe usage)
+volatile int activityPackets = 0;
+
 // Timing
 unsigned long lastFastTick = 0;
 unsigned long lastSlowTick = 0;
@@ -112,7 +118,9 @@ public:
     // Base Sparkles
     uint8_t baseHue = map((int)swarmAvgVal, 0, 100, 160, 0);
     int activity = map((int)swarmEnergy, 0, 255, 2, 20);
-    activity += (rawPacketCount * 2); 
+
+    // Use the atomic snapshot variable updated in fastTick()
+    activity += (activityPackets * 2); 
     
     if (random8() < activity) {
        int pos = random(NUM_LEDS);
@@ -218,6 +226,8 @@ void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
   memcpy(&in, incomingData, sizeof(in));
   if (in.header.version != SWARM_PROTO_VERSION) return;
 
+  // copy into global BEFORE signalling
+  incomingMsg = in;
   msgReceived = true; 
 
   // IDENTITY
@@ -341,7 +351,14 @@ void manageIdentity() {
 void fastTick() {
   unsigned long now = millis();
   currentBrightness = (currentBrightness * 0.95) + (swarmEnergy * 0.05);
-  if (rawPacketCount > 0) rawPacketCount--;
+
+  // Atomically capture and reset raw packet counter (ISR increments it)
+  noInterrupts();
+  int pc = rawPacketCount;
+  rawPacketCount = 0;
+  interrupts();
+  activityPackets = pc; // update snapshot for renderer
+
   renderer.render(now);
 }
 
@@ -365,6 +382,9 @@ void slowTick() {
       }
 
       SwarmMessage msg; msg.header.version = SWARM_PROTO_VERSION; msg.header.msgType = MSG_ANNOUNCE; msg.header.senderId = swarmId; msg.header.bootToken = bootToken;
+      // Include position (0/0 by default) and capabilities
+      msg.data.announce.posX = 0;
+      msg.data.announce.posY = 0;
       msg.data.announce.capabilities = 4; 
       esp_now_send(BROADCAST_ADDR, (uint8_t *) &msg, sizeof(msg));
   }
@@ -380,6 +400,13 @@ void setup() {
   renderer.begin();
   bootToken = esp_random();
   prefs.begin("swarm", false);
+
+  // Restore persisted state
+  swarmId = prefs.getUShort("swarmId", 0);
+  if (swarmId != 0) nodeState = ID_ASSIGNED;
+
+  // Seed PRNG for non-deterministic behavior
+  randomSeed((unsigned long)esp_random());
 
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
