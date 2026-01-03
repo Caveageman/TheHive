@@ -66,6 +66,10 @@ bool hasSensor = false;
 bool isIsolated = false;
 unsigned long lastHeardMs = 0;
 
+//Sweep
+const bool ENABLE_SWEEP_REPORT = true;       // Set TRUE to sweep all channels
+const unsigned long SWEEP_SEND_DELAY_MS = 15; // Slight increase to prevent packet choke
+
 // Data State
 float localPrimaryVal = 0.0; 
 float swarmAvgVal = 0.0;     
@@ -150,10 +154,11 @@ volatile int currentChannel = 1;       // channel where the radio currently list
 unsigned long lastChannelEval = 0;
 unsigned long channelLockUntil = 0;
 
-const unsigned long CHANNEL_EVAL_INTERVAL = 10000;  // evaluate every 10s
-const unsigned long CHANNEL_LOCK_DURATION  = 60000; // stay locked 60s after choosing
-const bool ENABLE_SWEEP_REPORT = false;             // set true to also sweep and send on all channels
-const unsigned long SWEEP_SEND_DELAY_MS = 10;       // delay between sends when sweeping
+//Commented out due to conflict with burst comms
+//const unsigned long CHANNEL_EVAL_INTERVAL = 10000;  // evaluate every 10s
+//const unsigned long CHANNEL_LOCK_DURATION  = 60000; // stay locked 60s after choosing
+//const bool ENABLE_SWEEP_REPORT = false;             // set true to also sweep and send on all channels
+//const unsigned long SWEEP_SEND_DELAY_MS = 10;       // delay between sends when sweeping
 
 // ======================
 // 🎨 RENDERER CLASS
@@ -430,72 +435,56 @@ void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
 }
 
 // ======================
-// CHANNEL EVALUATION / REPORTING HELPERS
+// 🛰️ NEW: ACTIVE SCANNER & HOPPER
 // ======================
-
-void evaluateChannels() {
+void scanAndHop() {
   unsigned long now = millis();
-  if (now - lastChannelEval < CHANNEL_EVAL_INTERVAL) return;
-  lastChannelEval = now;
+  
+  // 1. HOP LOGIC: Switch channels rapidly to "scan" the air
+  // We hop every 100-200ms to gather visual data from the whole spectrum
+  if (now - lastChannelEval > 150) { 
+    lastChannelEval = now;
 
-  int bestCh = 1;
-  uint32_t bestScore = 0;
-
-  noInterrupts();
-  for (int ch = 1; ch <= 13; ch++) {
-    uint32_t cnt = channelCounts[ch];
-    uint32_t avgRssi = 0;
-    if (channelCounts[ch] > 0) avgRssi = (uint32_t)((channelRSSI[ch] / channelCounts[ch]) + 100); // bias positive
-    uint32_t score = (cnt * 2) + avgRssi;
-    if (score > bestScore) { bestScore = score; bestCh = ch; }
-    channelCounts[ch] = 0;
-    channelRSSI[ch] = 0;
-  }
-  interrupts();
-
-  // If currently locked, don't switch until lock expires
-  if (channelLockUntil != 0 && millis() < channelLockUntil) {
-    return;
-  } else {
-    currentChannel = bestCh;
+    // Move to next channel (Round Robin 1 -> 13)
+    currentChannel++;
+    if (currentChannel > 13) currentChannel = 1;
+    
     esp_wifi_set_channel(currentChannel, WIFI_SECOND_CHAN_NONE);
-    channelLockUntil = millis() + CHANNEL_LOCK_DURATION;
+    
+    // Reset counters for the new channel so visuals are fresh
+    reportPacketCount = 0; 
+  }
+}
 
-    // Build and send Swarm STATE report with traffic aggregated
-    SwarmMessage reportMsg;
-    memset(&reportMsg, 0, sizeof(reportMsg));
-    reportMsg.header.version = SWARM_PROTO_VERSION;
-    reportMsg.header.msgType = MSG_STATE;
-    reportMsg.header.senderId = swarmId;
-    reportMsg.header.bootToken = bootToken;
-    reportMsg.data.state.temp = hasSensor ? sht31.readTemperature() : 0.0;
-    reportMsg.data.state.humidity = hasSensor ? sht31.readHumidity() : swarmAvgVal;
-    reportMsg.data.state.energy = (uint8_t)currentBrightness;
-    reportMsg.data.state.traffic = reportPacketCount;
-
-    esp_now_send(BROADCAST_ADDR, (uint8_t*)&reportMsg, sizeof(reportMsg));
-
-    if (ENABLE_SWEEP_REPORT) {
-      uint8_t baddr[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
-      esp_now_peer_info_t peer = {};
-      memcpy(peer.peer_addr, baddr, 6);
-      peer.channel = 0;
-      peer.encrypt = false;
-      esp_now_add_peer(&peer);
-
-      for (int ch = 1; ch <= 13; ch++) {
-        esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
-        esp_now_send(baddr, (uint8_t*)&reportMsg, sizeof(reportMsg));
-        delay(SWEEP_SEND_DELAY_MS);
-      }
-      // return to locked channel
-      esp_wifi_set_channel(currentChannel, WIFI_SECOND_CHAN_NONE);
+// Helper to blast a message across all channels (The "Old Way")
+void sendMultiChannelBurst(uint8_t* data, size_t len) {
+    if (!ENABLE_SWEEP_REPORT) {
+        esp_now_send(BROADCAST_ADDR, data, len);
+        return;
     }
 
-    // reset aggregation counters
-    reportPacketCount = 0;
-    totalRSSI = 0;
-  }
+    // Save current channel to return to it later
+    uint8_t originalCh = currentChannel;
+
+    // Temporary Peer for broadcasting
+    uint8_t baddr[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+    esp_now_peer_info_t peer = {};
+    memcpy(peer.peer_addr, baddr, 6);
+    peer.encrypt = false;
+
+    for (int ch = 1; ch <= 13; ch++) {
+        esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
+        // We have to re-add the peer on some ESP versions when changing channels
+        // forcing the peer channel to 0 (any) or current helps
+        peer.channel = ch;
+        esp_now_add_peer(&peer); 
+        
+        esp_now_send(baddr, data, len);
+        delay(SWEEP_SEND_DELAY_MS);
+    }
+    
+    // Return to scanning
+    esp_wifi_set_channel(originalCh, WIFI_SECOND_CHAN_NONE);
 }
 
 // ======================
@@ -538,7 +527,7 @@ void manageIdentity() {
         msg.header.senderId = 0; 
         msg.header.bootToken = bootToken;
         msg.data.id.targetId = candidateId;
-        esp_now_send(BROADCAST_ADDR, (uint8_t *) &msg, sizeof(msg));
+        sendMultiChannelBurst((uint8_t *) &msg, sizeof(msg));
         nodeState = ID_CLAIMING;
         stateTimer = now;
       }
@@ -600,7 +589,7 @@ void updateSensors() {
       msg.data.state.traffic = reportPacketCount;
       msg.data.state.traffic = (uint16_t)reportPacketCount;
 
-      esp_now_send(BROADCAST_ADDR, (uint8_t *) &msg, sizeof(msg));
+      sendMultiChannelBurst((uint8_t *) &msg, sizeof(msg));
 
       if (isBioEvent) {
           SwarmMessage bioMsg;
@@ -610,7 +599,7 @@ void updateSensors() {
           bioMsg.data.event.eventId = 5; 
           bioMsg.data.event.intensity = (uint8_t)constrain(localPrimaryVal * 5, 0, 255);
           bioMsg.data.event.durationMs = 1000;
-          esp_now_send(BROADCAST_ADDR, (uint8_t *) &bioMsg, sizeof(bioMsg));
+          sendMultiChannelBurst((uint8_t *) &bioMsg, sizeof(bioMsg));
       }
     }
   }
@@ -733,7 +722,7 @@ void mediumTick() {
 
 void slowTick() {
   // Evaluate channels early so locking & reporting happens before other announcements
-  evaluateChannels();
+    scanAndHop();
 
   isIsolated = (millis() - lastHeardMs) > 15000;
   
@@ -778,7 +767,7 @@ void slowTick() {
           msg.data.event.eventId = 1; // CRASH
           msg.data.event.intensity = 200;
           msg.data.event.durationMs = 3000;
-          esp_now_send(BROADCAST_ADDR, (uint8_t *) &msg, sizeof(msg));
+          sendMultiChannelBurst((uint8_t *) &msg, sizeof(msg));
           Serial.println("Auto-Trigger: CRASH");
       }
       // 2. SATELLITE 
@@ -791,7 +780,7 @@ void slowTick() {
           msg.data.event.eventId = 2; // SATELLITE
           msg.data.event.intensity = 150;
           msg.data.event.durationMs = 6000;
-          esp_now_send(BROADCAST_ADDR, (uint8_t *) &msg, sizeof(msg));
+          sendMultiChannelBurst((uint8_t *) &msg, sizeof(msg));
           Serial.println("Auto-Trigger: SATELLITE");
       }
   }
@@ -802,7 +791,7 @@ void slowTick() {
       syncMsg.header.version = SWARM_PROTO_VERSION;
       syncMsg.header.msgType = MSG_SYNC;
       syncMsg.header.senderId = swarmId;
-      esp_now_send(BROADCAST_ADDR, (uint8_t *) &syncMsg, sizeof(syncMsg));
+      sendMultiChannelBurst((uint8_t *) &syncMsg, sizeof(syncMsg));
   }
 
   if (nodeState == ID_ASSIGNED) {
@@ -814,7 +803,7 @@ void slowTick() {
     msg.data.announce.posX = posX;
     msg.data.announce.posY = posY;
     msg.data.announce.capabilities = (hasOLED ? 1 : 0); 
-    esp_now_send(BROADCAST_ADDR, (uint8_t *) &msg, sizeof(msg));
+    sendMultiChannelBurst((uint8_t *) &msg, sizeof(msg));
   }
 }
 
@@ -914,7 +903,8 @@ void loop() {
         msg.data.event.eventId = 1; // CRASH
         msg.data.event.intensity = 120;
         msg.data.event.durationMs = 2000;
-        esp_now_send(BROADCAST_ADDR, (uint8_t *) &msg, sizeof(msg));
+        sendMultiChannelBurst((uint8_t *) &msg, sizeof(msg));
     }
   }
 }
+
