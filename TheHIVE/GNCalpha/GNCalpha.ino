@@ -187,6 +187,25 @@ public:
         display->setCursor(0, 120);
         display->print("ISO");
     }
+
+    // ... inside render() ...
+
+    // [NEW] CRT Scanline Effect
+    static int scanY = 0;
+    static int scanDir = 1;
+    
+    // Move the scanline
+    scanY += scanDir;
+    if (scanY >= VISUAL_HEIGHT || scanY < 0) scanDir = -scanDir; // Bounce top/bottom
+
+    // Draw the line (Invert pixels where it passes for a ghostly look)
+    // Note: In portrait, we draw a horizontal line relative to the rotation
+    // The screen is 32 wide, 128 high.
+    // display->drawFastHLine(0, scanY, 32, SSD1306_INVERSE); 
+    
+    // Since we are rotated, X is the short side (0-31), Y is long (0-127)
+    display->drawFastHLine(0, scanY, 32, SSD1306_INVERSE);
+    
     display->display();
   }
 

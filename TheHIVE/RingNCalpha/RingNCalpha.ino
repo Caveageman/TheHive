@@ -9,7 +9,6 @@
 // ======================
 // 🛠️ HARDWARE PINS (QUEEN NODE)
 // ======================
-// No OLED, No SHT31. Just Lights.
 #define LED_PIN_RING    5   // WS2812B Data
 #define LED_PIN_CORE    21  // PWM White LED (The "Heart")
 #define NUM_LEDS        37  
@@ -23,13 +22,12 @@
 #define CPU_MHZ 80 
 
 // Timing
-#define FAST_TICK_MS    20   // Faster tick for smooth LEDs (50fps)
-#define MED_TICK_MS     100  
-#define SLOW_TICK_MS    4000 
+#define FAST_TICK_MS    20   // 50 FPS for smooth LEDs
+#define SLOW_TICK_MS    4000 // 4s for Swarm Decisions
 
-// Personality: The Queen is Stable. She observes.
-#define BASE_CHANCE_CRASH     1      // Very low chance to crash herself
-#define BASE_CHANCE_SATELLITE 20     // Good at spotting satellites
+// Personality (Stable Observer)
+#define BASE_CHANCE_CRASH     1      
+#define BASE_CHANCE_SATELLITE 20     
 
 // ======================
 // GLOBAL STATE
@@ -38,11 +36,6 @@ uint32_t bootToken;
 uint16_t swarmId = 0; 
 Preferences prefs;
 
-// Flags
-bool isIsolated = false;
-unsigned long lastHeardMs = 0;
-volatile int rawPacketCount = 0; 
-
 // Swarm Data
 float swarmAvgVal = 0.0;     
 float swarmEnergy = 255.0; 
@@ -50,6 +43,10 @@ float currentBrightness = 255.0;
 
 // LED Objects
 CRGB leds[NUM_LEDS];
+
+// Pulse State (From ringgate2)
+int trfPulseLoc = -1; // Clockwise Pulse
+int synPulseLoc = -1; // Counter-Clockwise Pulse
 
 // Animation State
 enum VisualMode { VIS_TRAFFIC, VIS_BIO, VIS_SAT, VIS_CRASH };
@@ -64,10 +61,10 @@ const int SAT_END = 29;
 // Comms
 SwarmMessage incomingMsg;
 volatile bool msgReceived = false;
+volatile int rawPacketCount = 0; 
 
 // Timing
 unsigned long lastFastTick = 0;
-unsigned long lastMedTick  = 0;
 unsigned long lastSlowTick = 0;
 
 // Identity
@@ -110,14 +107,10 @@ public:
     }
 
     // 2. Default: Traffic / Swarm Energy
-    // Fade trail
     fadeToBlackBy(leds, NUM_LEDS, 20); 
 
-    // Base color based on Swarm Average (Humidity/Mood)
-    // Map 0-100 to Hue (Blue->Green->Red)
+    // Base Sparkles
     uint8_t baseHue = map((int)swarmAvgVal, 0, 100, 160, 0);
-    
-    // Sparkle Probability based on Energy + Packet Traffic
     int activity = map((int)swarmEnergy, 0, 255, 2, 20);
     activity += (rawPacketCount * 2); 
     
@@ -126,9 +119,30 @@ public:
        leds[pos] += CHSV(baseHue, 255, 255);
     }
     
-    // Core LED: Alien Breathing (Same math as Nodes)
+    // --- DIRECTIONAL PULSES (Steal from ringgate2) ---
+    
+    // Traffic Pulse (Clockwise - Teal)
+    if (trfPulseLoc >= 0) {
+        leds[trfPulseLoc] += CHSV(140, 255, 255); 
+        // Trail
+        if(trfPulseLoc > 0) leds[trfPulseLoc-1] += CHSV(140, 255, 100);
+        
+        trfPulseLoc++;
+        if (trfPulseLoc >= NUM_LEDS) trfPulseLoc = -1;
+    }
+
+    // Sync Pulse (Counter-Clockwise - White)
+    if (synPulseLoc >= 0) {
+        leds[synPulseLoc] += CHSV(0, 0, 255);
+        // Trail
+        if(synPulseLoc < NUM_LEDS-1) leds[synPulseLoc+1] += CHSV(0, 0, 100);
+        
+        synPulseLoc--;
+        if (synPulseLoc < 0) synPulseLoc = -1;
+    }
+
+    // Core LED: Alien Breathing
     float breath = (exp(sin(now/2000.0*PI)) - 0.36787944)*108.0;
-    // Scale by Swarm Energy (dim if stealth mode)
     int coreBri = map((int)breath, 0, 255, 0, (int)currentBrightness);
     analogWrite(LED_PIN_CORE, coreBri);
 
@@ -137,15 +151,11 @@ public:
 
 private:
   void runBioEffect(unsigned long elapsed, unsigned long duration) {
-    // Fill up the ring like a gauge
     float p = (float)elapsed / (float)duration; 
     int h = p * (NUM_LEDS/2); 
-    
-    // Flash Core
     analogWrite(LED_PIN_CORE, (sin(elapsed * 0.01) + 1) * 127);
-    
     for (int i=0; i<=h; i++) { 
-        CRGB c = CHSV(96+(i*2), 255, 180); // Greenish fill
+        CRGB c = CHSV(96+(i*2), 255, 180); 
         if(i < NUM_LEDS) leds[i] = c; 
         if(NUM_LEDS-1-i >= 0) leds[NUM_LEDS-1-i] = c; 
     }
@@ -154,33 +164,35 @@ private:
   void runSatEffect(unsigned long elapsed, unsigned long duration) {
     fadeToBlackBy(leds, NUM_LEDS, 60); 
     float p = (float)elapsed / (float)duration;
-    // Move pixel from Start to End
     int pos = (int)(SAT_START + (p * (SAT_END - SAT_START)));
-    if (pos >= 0 && pos < NUM_LEDS) leds[pos] = CRGB::Cyan;
+    
+    if (pos >= 0 && pos < NUM_LEDS) {
+        // Glitch Logic (Steal from ringgate2)
+        if (random8() > 220) {
+             leds[pos] = CRGB::White; // Glitch flash
+        } else {
+             leds[pos] = CRGB::Cyan;  // Normal signal
+        }
+        // Trail
+        if(pos > 0) leds[pos-1] += CHSV(128, 255, 60); 
+    }
   }
 
   void runCrashEffect(unsigned long elapsed, unsigned long duration) {
     float progress = (float)elapsed / (float)duration;
-    
     if (progress < 0.40) {
-      // Phase 1: Chaos
       fadeToBlackBy(leds, NUM_LEDS, 100);
       leds[random(NUM_LEDS)] = (random(2)) ? CRGB::Red : CRGB::White;
       analogWrite(LED_PIN_CORE, (random(2) ? 255 : 0));
-    } 
-    else if (progress < 0.50) {
-      // Phase 2: Blackout
+    } else if (progress < 0.50) {
       fill_solid(leds, NUM_LEDS, CRGB::Black); 
       analogWrite(LED_PIN_CORE, 0);
-    } 
-    else {
-      // Phase 3: Spin Reboot
+    } else {
       float spin = (progress - 0.50) * 2.0;
-      float revs = 20.0 * (spin * spin * spin); // Accelerating spin
+      float revs = 20.0 * (spin * spin * spin); 
       long total = (long)(revs * NUM_LEDS);
       int head = total % NUM_LEDS;
       int tailLen = 8;
-      
       fadeToBlackBy(leds, NUM_LEDS, 120);
       for (int i = 0; i < tailLen; i++) {
         int px = (head - i + NUM_LEDS) % NUM_LEDS;
@@ -207,12 +219,10 @@ void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
   if (in.header.version != SWARM_PROTO_VERSION) return;
 
   msgReceived = true; 
-  lastHeardMs = millis(); 
 
   // IDENTITY
   if (in.header.msgType == MSG_ID_CLAIM) {
     if (nodeState == ID_ASSIGNED && in.data.id.targetId == swarmId) {
-      // Defense: Queen claims her ID strongly
       SwarmMessage conflict;
       conflict.header.version = SWARM_PROTO_VERSION;
       conflict.header.msgType = MSG_ID_CONFLICT;
@@ -227,21 +237,20 @@ void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
     }
   }
 
-  // EVENTS: Trigger Visual Modes
+  // EVENTS
   if (in.header.msgType == MSG_EVENT) {
-    // 1=Crash, 2=Sat, 4=Dark, 5=Bio
     switch(in.data.event.eventId) {
       case 1: // CRASH
         currentMode = VIS_CRASH; 
         modeStartTime = millis(); 
-        modeDuration = in.data.event.durationMs + 2000; // Extra time for spin
+        modeDuration = in.data.event.durationMs + 2000; 
         break;
       case 2: // SATELLITE
         currentMode = VIS_SAT; 
         modeStartTime = millis(); 
         modeDuration = in.data.event.durationMs;
         break;
-      case 5: // BIO (Breath)
+      case 5: // BIO
         currentMode = VIS_BIO;
         modeStartTime = millis();
         modeDuration = 2000;
@@ -252,49 +261,45 @@ void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
     }
   }
 
-  // STATE: Aggregate Data
+  // STATE & SYNC
   if (in.header.msgType == MSG_STATE) {
+    // Trigger Clockwise Pulse
+    if (trfPulseLoc == -1) trfPulseLoc = 0; 
+    
     float incomingVal = in.data.state.humidity;
-    // Update Swarm Average (Color)
     if (swarmAvgVal == 0) swarmAvgVal = incomingVal;
     else swarmAvgVal = (swarmAvgVal * 0.95) + (incomingVal * 0.05);
     
-    // Update Swarm Energy (Activity)
     float incEnergy = in.data.state.energy;
     swarmEnergy = (swarmEnergy * 0.9) + (incEnergy * 0.1);
+  }
+  if (in.header.msgType == MSG_SYNC) {
+      // Trigger Counter-Clockwise Pulse
+      if (synPulseLoc == -1) synPulseLoc = NUM_LEDS - 1; 
   }
 }
 
 // ======================
-// HELPER FUNCTIONS
+// BOOT SEQUENCE
 // ======================
 void runBootSequence() {
-  // Step 1: "BOOT" equivalent (Red Quadrant)
   fill_solid(leds, NUM_LEDS, CRGB::Black);
   for(int i=0; i<NUM_LEDS/4; i++) leds[i] = CRGB::Red;
-  FastLED.show();
-  delay(200); 
+  FastLED.show(); delay(200); 
   fill_solid(leds, NUM_LEDS, CRGB::Black); FastLED.show(); delay(50);
 
-  // Step 2: "MEM OK" equivalent (Yellow Half)
   for(int i=0; i<NUM_LEDS/2; i++) leds[i] = CRGB::Yellow;
-  FastLED.show();
-  delay(200);
+  FastLED.show(); delay(200);
   fill_solid(leds, NUM_LEDS, CRGB::Black); FastLED.show(); delay(50);
 
-  // Step 3: "RADIO" equivalent (Blue 3/4)
   for(int i=0; i<(NUM_LEDS*3)/4; i++) leds[i] = CRGB::Blue;
-  FastLED.show();
-  delay(200);
+  FastLED.show(); delay(200);
   fill_solid(leds, NUM_LEDS, CRGB::Black); FastLED.show(); delay(50);
 
-  // Step 4: "HIVE" equivalent (Full White + Core Flash)
   fill_solid(leds, NUM_LEDS, CRGB::White);
   analogWrite(LED_PIN_CORE, 255);
-  FastLED.show();
-  delay(500); // Longer pause like the OLED nodes
+  FastLED.show(); delay(500); 
 
-  // Cleanup
   fill_solid(leds, NUM_LEDS, CRGB::Black);
   analogWrite(LED_PIN_CORE, 0);
   FastLED.show();
@@ -322,12 +327,8 @@ void manageIdentity() {
         swarmId = candidateId;
         nodeState = ID_ASSIGNED;
         prefs.putUShort("swarmId", swarmId);
-        // Visual confirmation on Ring
-        fill_solid(leds, NUM_LEDS, CRGB::White);
-        FastLED.show();
-        delay(50);
-        fill_solid(leds, NUM_LEDS, CRGB::Black);
-        FastLED.show();
+        fill_solid(leds, NUM_LEDS, CRGB::White); FastLED.show(); delay(50);
+        fill_solid(leds, NUM_LEDS, CRGB::Black); FastLED.show();
       }
       break;
     case ID_ASSIGNED: break;
@@ -339,65 +340,33 @@ void manageIdentity() {
 // ======================
 void fastTick() {
   unsigned long now = millis();
-  
-  // Smooth Brightness
   currentBrightness = (currentBrightness * 0.95) + (swarmEnergy * 0.05);
-  
-  // Decay packet count for visualizer
   if (rawPacketCount > 0) rawPacketCount--;
-
-  // RENDER
   renderer.render(now);
 }
 
 void slowTick() {
-  // --- AUTONOMOUS TRIGGERS ---
-  // The Queen is less glitchy, but she observes deep space.
   if (nodeState == ID_ASSIGNED) {
       long r = random(0, 10000);
-      
       long crashThresh = BASE_CHANCE_CRASH;
-      long satThresh   = BASE_CHANCE_SATELLITE;
-
+      long satThresh = BASE_CHANCE_SATELLITE;
+      
       if (currentBrightness > 200) satThresh *= 2; 
       else if (currentBrightness < 50) { satThresh /= 10; crashThresh /= 10; }
 
-      // 1. CRASH 
       if (r < crashThresh) {
-          SwarmMessage msg;
-          msg.header.version = SWARM_PROTO_VERSION;
-          msg.header.msgType = MSG_EVENT;
-          msg.header.senderId = swarmId;
-          msg.header.bootToken = bootToken;
-          msg.data.event.eventId = 1; 
-          msg.data.event.intensity = 200;
-          msg.data.event.durationMs = 3000;
+          SwarmMessage msg; msg.header.version = SWARM_PROTO_VERSION; msg.header.msgType = MSG_EVENT; msg.header.senderId = swarmId; msg.header.bootToken = bootToken;
+          msg.data.event.eventId = 1; msg.data.event.intensity = 200; msg.data.event.durationMs = 3000;
+          esp_now_send(BROADCAST_ADDR, (uint8_t *) &msg, sizeof(msg));
+      } else if (r < (crashThresh + satThresh)) {
+          SwarmMessage msg; msg.header.version = SWARM_PROTO_VERSION; msg.header.msgType = MSG_EVENT; msg.header.senderId = swarmId; msg.header.bootToken = bootToken;
+          msg.data.event.eventId = 2; msg.data.event.intensity = 150; msg.data.event.durationMs = 6000;
           esp_now_send(BROADCAST_ADDR, (uint8_t *) &msg, sizeof(msg));
       }
-      // 2. SATELLITE 
-      else if (r < (crashThresh + satThresh)) {
-          SwarmMessage msg;
-          msg.header.version = SWARM_PROTO_VERSION;
-          msg.header.msgType = MSG_EVENT;
-          msg.header.senderId = swarmId;
-          msg.header.bootToken = bootToken;
-          msg.data.event.eventId = 2; 
-          msg.data.event.intensity = 150;
-          msg.data.event.durationMs = 6000;
-          esp_now_send(BROADCAST_ADDR, (uint8_t *) &msg, sizeof(msg));
-      }
-  }
 
-  // Announce Presence
-  if (nodeState == ID_ASSIGNED) {
-    SwarmMessage msg;
-    msg.header.version = SWARM_PROTO_VERSION;
-    msg.header.msgType = MSG_ANNOUNCE;
-    msg.header.senderId = swarmId;
-    msg.header.bootToken = bootToken;
-    // Capabilites: 4 = High Power LED / Queen
-    msg.data.announce.capabilities = 4; 
-    esp_now_send(BROADCAST_ADDR, (uint8_t *) &msg, sizeof(msg));
+      SwarmMessage msg; msg.header.version = SWARM_PROTO_VERSION; msg.header.msgType = MSG_ANNOUNCE; msg.header.senderId = swarmId; msg.header.bootToken = bootToken;
+      msg.data.announce.capabilities = 4; 
+      esp_now_send(BROADCAST_ADDR, (uint8_t *) &msg, sizeof(msg));
   }
 }
 
@@ -408,14 +377,10 @@ void setup() {
   setCpuFrequencyMhz(CPU_MHZ);
   Serial.begin(115200);
 
-  // Init LEDs
   renderer.begin();
-
-  // Data
   bootToken = esp_random();
   prefs.begin("swarm", false);
 
-  // WiFi
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
   
@@ -431,7 +396,6 @@ void setup() {
     esp_wifi_set_promiscuous_rx_cb(&wifi_promiscuous_cb);
   }
 
-  // Trigger Visual Boot Sequence to match standard nodes
   runBootSequence();
 }
 
@@ -440,6 +404,5 @@ void loop() {
   manageIdentity(); 
   
   if (now - lastFastTick >= FAST_TICK_MS) { lastFastTick = now; fastTick(); }
-  if (now - lastMedTick >= MED_TICK_MS) { lastMedTick = now; mediumTick(); }
   if (now - lastSlowTick >= SLOW_TICK_MS) { lastSlowTick = now; slowTick(); }
 }
