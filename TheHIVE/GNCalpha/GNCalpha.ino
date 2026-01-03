@@ -8,6 +8,9 @@
 #include <Adafruit_SHT31.h>
 #include "SwarmProtocol.h" 
 
+// Compile-time sanity check for ESP-NOW payload size
+static_assert(sizeof(SwarmMessage) <= 250, "SwarmMessage exceeds ESP-NOW payload size");
+
 // ======================
 // 🛠️ HARDWARE PINS (C3 SUPER MINI)
 // ======================
@@ -157,6 +160,8 @@ public:
     graphA = gA; graphB = gB;
     memset(graphA->values, 0, sizeof(graphA->values));
     memset(graphB->values, 0, sizeof(graphB->values));
+    graphA->head = 0;
+    graphB->head = 0;
   }
 
   void setOverlays(Overlay* ov, uint8_t count) {
@@ -188,21 +193,16 @@ public:
         display->print("ISO");
     }
 
-    // ... inside render() ...
-
-    // [NEW] CRT Scanline Effect
+    // [NEW] CRT Scanline Effect (clamped)
     static int scanY = 0;
     static int scanDir = 1;
     
-    // Move the scanline
+    // Move the scanline with clamping to valid range
     scanY += scanDir;
-    if (scanY >= VISUAL_HEIGHT || scanY < 0) scanDir = -scanDir; // Bounce top/bottom
+    if (scanY >= VISUAL_HEIGHT - 1) { scanY = VISUAL_HEIGHT - 1; scanDir = -1; }
+    else if (scanY <= 0) { scanY = 0; scanDir = 1; }
 
     // Draw the line (Invert pixels where it passes for a ghostly look)
-    // Note: In portrait, we draw a horizontal line relative to the rotation
-    // The screen is 32 wide, 128 high.
-    // display->drawFastHLine(0, scanY, 32, SSD1306_INVERSE); 
-    
     // Since we are rotated, X is the short side (0-31), Y is long (0-127)
     display->drawFastHLine(0, scanY, 32, SSD1306_INVERSE);
     
@@ -239,8 +239,11 @@ private:
       uint8_t drawY = (VISUAL_HEIGHT - 1) - i;
       applyOverlays(val, drawY);
       if (val != -128) {
-        display->drawPixel(xOffset + val, drawY, SSD1306_WHITE);
-        if (currentGraphWidth > 1) display->drawPixel(xOffset + val + 1, drawY, SSD1306_WHITE);
+        int x = xOffset + val;
+        if (x >= 0 && x < SCREEN_HW_WIDTH) {
+          display->drawPixel(x, drawY, SSD1306_WHITE);
+          if (currentGraphWidth > 1 && (x + 1) < SCREEN_HW_WIDTH) display->drawPixel(x + 1, drawY, SSD1306_WHITE);
+        }
       }
     }
   }
@@ -260,8 +263,11 @@ void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
   if (len != sizeof(SwarmMessage)) return;
   SwarmMessage in;
   memcpy(&in, incomingData, sizeof(in));
+
   if (in.header.version != SWARM_PROTO_VERSION) return;
 
+  // COPY into the global message BEFORE signaling
+  incomingMsg = in;
   msgReceived = true; 
   lastHeardMs = millis(); 
 
@@ -660,7 +666,14 @@ void setup() {
   pinMode(BOOT_BUTTON, INPUT_PULLUP);
   
   bootToken = esp_random();
+  // seed PRNG for non-deterministic random() usage
+  randomSeed((unsigned long)esp_random());
+
   prefs.begin("swarm", false);
+  // Restore persisted state
+  swarmId = prefs.getUShort("swarmId", 0);
+  if (swarmId != 0) nodeState = ID_ASSIGNED;
+
   posX = prefs.getUChar("posX", 255);
   posY = prefs.getUChar("posY", 255);
   if (posX == 255) {
