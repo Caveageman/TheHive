@@ -32,6 +32,11 @@ static_assert(sizeof(SwarmMessage) <= 250, "SwarmMessage exceeds ESP-NOW payload
 #define BASE_CHANCE_CRASH     1      
 #define BASE_CHANCE_SATELLITE 20     
 
+// Traffic -> Energy Logic
+#define TRAFFIC_BASELINE      10   // Packets per tick to maintain energy
+#define MIN_ENERGY            50.0 // Never go below this (Idling)
+#define MAX_ENERGY            255.0
+
 // ======================
 // GLOBAL STATE
 // ======================
@@ -41,8 +46,13 @@ Preferences prefs;
 
 // Swarm Data
 float swarmAvgVal = 0.0;     
-float swarmEnergy = 255.0; 
-float currentBrightness = 255.0; 
+float swarmEnergy = 100.0; // Start at medium energy
+float currentBrightness = 100.0; 
+
+// Traffic Data
+volatile int rawPacketCount = 0;        // Local packets (ISR)
+volatile int activityPackets = 0;       // Snapshot for logic
+volatile int remoteSwarmTraffic = 0;    // Sum of traffic reported by probes
 
 // LED Objects
 CRGB leds[NUM_LEDS];
@@ -64,10 +74,6 @@ const int SAT_END = 29;
 // Comms
 SwarmMessage incomingMsg;
 volatile bool msgReceived = false;
-volatile int rawPacketCount = 0; 
-
-// Activity snapshot (thread-safe usage)
-volatile int activityPackets = 0;
 
 // Timing
 unsigned long lastFastTick = 0;
@@ -79,6 +85,12 @@ IdState nodeState = ID_UNASSIGNED;
 uint16_t candidateId = 0;
 unsigned long stateTimer = 0;
 const int CLAIM_WINDOW_MS = 1500;
+
+// 🛰️ SCANNER VARS
+volatile int currentChannel = 1; 
+unsigned long lastChannelEval = 0;
+const bool ENABLE_SWEEP_REPORT = true; 
+const unsigned long SWEEP_SEND_DELAY_MS = 15;
 
 // ======================
 // RING RENDERER CLASS
@@ -102,8 +114,8 @@ public:
            currentMode = VIS_TRAFFIC; // Reset to default
        } else {
            switch(currentMode) {
-               case VIS_BIO:   runBioEffect(elapsed, modeDuration); break;
-               case VIS_SAT:   runSatEffect(elapsed, modeDuration); break;
+               case VIS_BIO:    runBioEffect(elapsed, modeDuration); break;
+               case VIS_SAT:    runSatEffect(elapsed, modeDuration); break;
                case VIS_CRASH: runCrashEffect(elapsed, modeDuration); break;
                default: break;
            }
@@ -119,22 +131,21 @@ public:
     uint8_t baseHue = map((int)swarmAvgVal, 0, 100, 160, 0);
     int activity = map((int)swarmEnergy, 0, 255, 2, 20);
 
-    // Use the atomic snapshot variable updated in fastTick()
-    activity += (activityPackets * 2); 
+    // Combine Local + Remote Traffic for EXTRA Sparkle density if busy
+    int totalTraffic = activityPackets + (remoteSwarmTraffic / 5);
+    if (totalTraffic > 20) activity += 5;
+    if (totalTraffic > 50) activity += 10;
     
     if (random8() < activity) {
        int pos = random(NUM_LEDS);
        leds[pos] += CHSV(baseHue, 255, 255);
     }
     
-    // --- DIRECTIONAL PULSES (Steal from ringgate2) ---
-    
+    // --- DIRECTIONAL PULSES ---
     // Traffic Pulse (Clockwise - Teal)
     if (trfPulseLoc >= 0) {
         leds[trfPulseLoc] += CHSV(140, 255, 255); 
-        // Trail
         if(trfPulseLoc > 0) leds[trfPulseLoc-1] += CHSV(140, 255, 100);
-        
         trfPulseLoc++;
         if (trfPulseLoc >= NUM_LEDS) trfPulseLoc = -1;
     }
@@ -142,9 +153,7 @@ public:
     // Sync Pulse (Counter-Clockwise - White)
     if (synPulseLoc >= 0) {
         leds[synPulseLoc] += CHSV(0, 0, 255);
-        // Trail
         if(synPulseLoc < NUM_LEDS-1) leds[synPulseLoc+1] += CHSV(0, 0, 100);
-        
         synPulseLoc--;
         if (synPulseLoc < 0) synPulseLoc = -1;
     }
@@ -175,13 +184,8 @@ private:
     int pos = (int)(SAT_START + (p * (SAT_END - SAT_START)));
     
     if (pos >= 0 && pos < NUM_LEDS) {
-        // Glitch Logic (Steal from ringgate2)
-        if (random8() > 220) {
-             leds[pos] = CRGB::White; // Glitch flash
-        } else {
-             leds[pos] = CRGB::Cyan;  // Normal signal
-        }
-        // Trail
+        if (random8() > 220) leds[pos] = CRGB::White; // Glitch flash
+        else leds[pos] = CRGB::Cyan;  // Normal signal
         if(pos > 0) leds[pos-1] += CHSV(128, 255, 60); 
     }
   }
@@ -214,6 +218,40 @@ private:
 RingRenderer renderer;
 
 // ======================
+// 🛰️ SCANNER & BURST HELPERS
+// ======================
+void scanAndHop() {
+  unsigned long now = millis();
+  if (now - lastChannelEval > 150) { 
+    lastChannelEval = now;
+    currentChannel++;
+    if (currentChannel > 13) currentChannel = 1;
+    esp_wifi_set_channel(currentChannel, WIFI_SECOND_CHAN_NONE);
+  }
+}
+
+void sendMultiChannelBurst(uint8_t* data, size_t len) {
+    if (!ENABLE_SWEEP_REPORT) {
+        esp_now_send(BROADCAST_ADDR, data, len);
+        return;
+    }
+    uint8_t originalCh = currentChannel;
+    uint8_t baddr[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+    esp_now_peer_info_t peer = {};
+    memcpy(peer.peer_addr, baddr, 6);
+    peer.encrypt = false;
+
+    for (int ch = 1; ch <= 13; ch++) {
+        esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
+        peer.channel = ch;
+        esp_now_add_peer(&peer); 
+        esp_now_send(baddr, data, len);
+        delay(SWEEP_SEND_DELAY_MS);
+    }
+    esp_wifi_set_channel(originalCh, WIFI_SECOND_CHAN_NONE);
+}
+
+// ======================
 // CALLBACKS
 // ======================
 void IRAM_ATTR wifi_promiscuous_cb(void* buf, wifi_promiscuous_pkt_type_t type) {
@@ -226,7 +264,6 @@ void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
   memcpy(&in, incomingData, sizeof(in));
   if (in.header.version != SWARM_PROTO_VERSION) return;
 
-  // copy into global BEFORE signalling
   incomingMsg = in;
   msgReceived = true; 
 
@@ -273,75 +310,21 @@ void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
 
   // STATE & SYNC
   if (in.header.msgType == MSG_STATE) {
-    // Trigger Clockwise Pulse
     if (trfPulseLoc == -1) trfPulseLoc = 0; 
     
+    // 🧠 HIVE MIND: Eat the remote traffic data
+    remoteSwarmTraffic += in.data.state.traffic;
+
     float incomingVal = in.data.state.humidity;
     if (swarmAvgVal == 0) swarmAvgVal = incomingVal;
     else swarmAvgVal = (swarmAvgVal * 0.95) + (incomingVal * 0.05);
     
+    // We still blend probe energy slightly so if THEY go dark, we feel it
     float incEnergy = in.data.state.energy;
-    swarmEnergy = (swarmEnergy * 0.9) + (incEnergy * 0.1);
+    swarmEnergy = (swarmEnergy * 0.95) + (incEnergy * 0.05);
   }
   if (in.header.msgType == MSG_SYNC) {
-      // Trigger Counter-Clockwise Pulse
       if (synPulseLoc == -1) synPulseLoc = NUM_LEDS - 1; 
-  }
-}
-
-// ======================
-// BOOT SEQUENCE
-// ======================
-void runBootSequence() {
-  fill_solid(leds, NUM_LEDS, CRGB::Black);
-  for(int i=0; i<NUM_LEDS/4; i++) leds[i] = CRGB::Red;
-  FastLED.show(); delay(200); 
-  fill_solid(leds, NUM_LEDS, CRGB::Black); FastLED.show(); delay(50);
-
-  for(int i=0; i<NUM_LEDS/2; i++) leds[i] = CRGB::Yellow;
-  FastLED.show(); delay(200);
-  fill_solid(leds, NUM_LEDS, CRGB::Black); FastLED.show(); delay(50);
-
-  for(int i=0; i<(NUM_LEDS*3)/4; i++) leds[i] = CRGB::Blue;
-  FastLED.show(); delay(200);
-  fill_solid(leds, NUM_LEDS, CRGB::Black); FastLED.show(); delay(50);
-
-  fill_solid(leds, NUM_LEDS, CRGB::White);
-  analogWrite(LED_PIN_CORE, 255);
-  FastLED.show(); delay(500); 
-
-  fill_solid(leds, NUM_LEDS, CRGB::Black);
-  analogWrite(LED_PIN_CORE, 0);
-  FastLED.show();
-}
-
-void manageIdentity() {
-  unsigned long now = millis();
-  switch (nodeState) {
-    case ID_UNASSIGNED:
-      if (now > stateTimer) { 
-        candidateId = random(1, 65);
-        SwarmMessage msg;
-        msg.header.version = SWARM_PROTO_VERSION;
-        msg.header.msgType = MSG_ID_CLAIM;
-        msg.header.senderId = 0; 
-        msg.header.bootToken = bootToken;
-        msg.data.id.targetId = candidateId;
-        esp_now_send(BROADCAST_ADDR, (uint8_t *) &msg, sizeof(msg));
-        nodeState = ID_CLAIMING;
-        stateTimer = now;
-      }
-      break;
-    case ID_CLAIMING:
-      if (now - stateTimer > CLAIM_WINDOW_MS) {
-        swarmId = candidateId;
-        nodeState = ID_ASSIGNED;
-        prefs.putUShort("swarmId", swarmId);
-        fill_solid(leds, NUM_LEDS, CRGB::White); FastLED.show(); delay(50);
-        fill_solid(leds, NUM_LEDS, CRGB::Black); FastLED.show();
-      }
-      break;
-    case ID_ASSIGNED: break;
   }
 }
 
@@ -350,19 +333,41 @@ void manageIdentity() {
 // ======================
 void fastTick() {
   unsigned long now = millis();
-  currentBrightness = (currentBrightness * 0.95) + (swarmEnergy * 0.05);
+  
+  // Decay remote traffic memory (so sparkles fade if probes stop reporting)
+  if (remoteSwarmTraffic > 0) remoteSwarmTraffic -= 5;
+  if (remoteSwarmTraffic < 0) remoteSwarmTraffic = 0;
 
-  // Atomically capture and reset raw packet counter (ISR increments it)
+  // Atomically capture local packets
   noInterrupts();
   int pc = rawPacketCount;
   rawPacketCount = 0;
   interrupts();
-  activityPackets = pc; // update snapshot for renderer
+  activityPackets = pc; 
+
+  // 🧠 TRAFFIC -> ENERGY LOGIC
+  // Total = Local Packets + Scaled Remote Packets
+  int totalActivity = activityPackets + (remoteSwarmTraffic / 4);
+
+  // Adjust Energy based on Baseline
+  if (totalActivity > TRAFFIC_BASELINE) {
+      swarmEnergy += 0.5; // Slow rise when busy
+  } else {
+      swarmEnergy -= 0.1; // Very slow decay when quiet
+  }
+  // Clamp Energy (Never fully sleep, never explode)
+  if (swarmEnergy < MIN_ENERGY) swarmEnergy = MIN_ENERGY;
+  if (swarmEnergy > MAX_ENERGY) swarmEnergy = MAX_ENERGY;
+
+  // Smooth visual brightness
+  currentBrightness = (currentBrightness * 0.9) + (swarmEnergy * 0.1);
 
   renderer.render(now);
 }
 
 void slowTick() {
+  scanAndHop(); // Keep looking for data
+
   if (nodeState == ID_ASSIGNED) {
       long r = random(0, 10000);
       long crashThresh = BASE_CHANCE_CRASH;
@@ -371,22 +376,22 @@ void slowTick() {
       if (currentBrightness > 200) satThresh *= 2; 
       else if (currentBrightness < 50) { satThresh /= 10; crashThresh /= 10; }
 
+      // Autonomous Events (Crash/Sat)
       if (r < crashThresh) {
           SwarmMessage msg; msg.header.version = SWARM_PROTO_VERSION; msg.header.msgType = MSG_EVENT; msg.header.senderId = swarmId; msg.header.bootToken = bootToken;
           msg.data.event.eventId = 1; msg.data.event.intensity = 200; msg.data.event.durationMs = 3000;
-          esp_now_send(BROADCAST_ADDR, (uint8_t *) &msg, sizeof(msg));
+          sendMultiChannelBurst((uint8_t *) &msg, sizeof(msg));
       } else if (r < (crashThresh + satThresh)) {
           SwarmMessage msg; msg.header.version = SWARM_PROTO_VERSION; msg.header.msgType = MSG_EVENT; msg.header.senderId = swarmId; msg.header.bootToken = bootToken;
           msg.data.event.eventId = 2; msg.data.event.intensity = 150; msg.data.event.durationMs = 6000;
-          esp_now_send(BROADCAST_ADDR, (uint8_t *) &msg, sizeof(msg));
+          sendMultiChannelBurst((uint8_t *) &msg, sizeof(msg));
       }
 
-      SwarmMessage msg; msg.header.version = SWARM_PROTO_VERSION; msg.header.msgType = MSG_ANNOUNCE; msg.header.senderId = swarmId; msg.header.bootToken = bootToken;
-      // Include position (0/0 by default) and capabilities
-      msg.data.announce.posX = 0;
-      msg.data.announce.posY = 0;
-      msg.data.announce.capabilities = 4; 
-      esp_now_send(BROADCAST_ADDR, (uint8_t *) &msg, sizeof(msg));
+      // Announce Presence + Current Energy (So probes know the hive mood)
+      SwarmMessage msg; msg.header.version = SWARM_PROTO_VERSION; msg.header.msgType = MSG_STATE; msg.header.senderId = swarmId; msg.header.bootToken = bootToken;
+      msg.data.state.energy = (uint8_t)currentBrightness; // Share the computed energy!
+      msg.data.state.traffic = activityPackets; // Share our local view too
+      sendMultiChannelBurst((uint8_t *) &msg, sizeof(msg));
   }
 }
 
@@ -401,11 +406,9 @@ void setup() {
   bootToken = esp_random();
   prefs.begin("swarm", false);
 
-  // Restore persisted state
   swarmId = prefs.getUShort("swarmId", 0);
   if (swarmId != 0) nodeState = ID_ASSIGNED;
 
-  // Seed PRNG for non-deterministic behavior
   randomSeed((unsigned long)esp_random());
 
   WiFi.mode(WIFI_STA);
@@ -423,12 +426,15 @@ void setup() {
     esp_wifi_set_promiscuous_rx_cb(&wifi_promiscuous_cb);
   }
 
+  currentChannel = 1;
+  esp_wifi_set_channel(currentChannel, WIFI_SECOND_CHAN_NONE);
+
   runBootSequence();
 }
 
 void loop() {
   unsigned long now = millis();
-  manageIdentity(); 
+  if (nodeState == ID_UNASSIGNED || nodeState == ID_CLAIMING) manageIdentity();
   
   if (now - lastFastTick >= FAST_TICK_MS) { lastFastTick = now; fastTick(); }
   if (now - lastSlowTick >= SLOW_TICK_MS) { lastSlowTick = now; slowTick(); }
