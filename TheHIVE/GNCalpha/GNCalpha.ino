@@ -685,7 +685,7 @@ void setup() {
 
   Wire.begin(I2C_SDA, I2C_SCL); 
   renderer.begin();
-  if (display.Width() > 0) hasOLED = true; 
+  if (display.width() > 0) hasOLED = true; 
   renderer.setGraphs(&graphDataA, &graphDataB);
   renderer.setOverlays(activeOverlays, 2);
   
@@ -746,4 +746,5 @@ void loop() {
     }
   }
 }
+
 
