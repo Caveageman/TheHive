@@ -30,8 +30,6 @@ static_assert(sizeof(SwarmMessage) <= 250, "SwarmMessage exceeds ESP-NOW payload
 // 🤖 NODE PERSONALITY & CONFIG
 // ======================
 // Base probabilities per 10,000 ticks (~11 hours)
-// Modify these to give a node a specific "Character"
-
 #define BASE_CHANCE_CRASH     15      // Default: 5 (Rare)
 #define BASE_CHANCE_SATELLITE 115     // Default: 15 (Uncommon)
 
@@ -141,7 +139,7 @@ Overlay activeOverlays[2];
 bool wasCrashing = false; 
 
 // ======================
-// RENDERER CLASS
+// 🎨 RENDERER CLASS
 // ======================
 class OLEDRenderer {
 public:
@@ -176,36 +174,70 @@ public:
 
   void render() {
     display->clearDisplay();
-    renderGraph(graphA, 4);  
-    renderGraph(graphB, 18); 
 
-    display->setTextSize(1);
+    // Use runtime dimensions so rotation / different SSD sizes are handled safely
+    int w = display->width();
+    int h = display->height();
+
+    // --- UI CONFIG (runtime-based) ---
+    const int HEADER_LINE_Y = 8;
+    const int GRAPH_TOP     = HEADER_LINE_Y + 2;
+    const int GRAPH_BOT     = h - 16; 
+    const int FOOTER_LINE_Y = h - 16; 
+    const int FOOTER_TEXT_Y = h - 13; 
+
+    // --- initialize scanline on first call (must be runtime-aware) ---
+    static int scanY = 0;
+    static bool scanInit = false;
+    if (!scanInit) { scanY = GRAPH_TOP; scanInit = true; }
+
+    // --- 1. HEADER (#01) ---
     display->setCursor(0, 0);
-    
-    if (swarmId == 0) display->print("??");
-    else {
-      if (swarmId < 10) display->print("0");
-      display->print(swarmId);
+    if (swarmId == 0) {
+        display->print("??");
+    } else {
+        display->print("#");
+        if (swarmId < 10) display->print("0");
+        display->print(swarmId);
     }
+    
+    // Slow Blink Activity Dot
+    if ((millis() / 500) % 2 == 0) {
+        // clip the dot inside current width/height
+        if (w > 26 && h > 3) display->fillCircle(26, 3, 2, SSD1306_WHITE);
+    }
+
+    display->drawLine(0, HEADER_LINE_Y, w - 1, HEADER_LINE_Y, SSD1306_WHITE);
+
+    // --- 2. GRAPHS (CENTERED & WINDOWED) ---
+    // Graph A moved from 6 -> 8 (Centers it in the left lane)
+    renderGraph(graphA, 8, GRAPH_TOP, GRAPH_BOT);  
+    
+    // Graph B at 24 (Centers it in the right lane)
+    renderGraph(graphB, 24, GRAPH_TOP, GRAPH_BOT); 
+
+    // --- 3. CRT SCANLINE ---
+    static int scanDir = 1;
+    scanY += scanDir;
+    if (scanY >= GRAPH_BOT) { scanY = GRAPH_BOT; scanDir = -1; }
+    else if (scanY <= GRAPH_TOP) { scanY = GRAPH_TOP; scanDir = 1; }
+    // draw entire width of scanline safely
+    display->drawFastHLine(0, scanY, w, SSD1306_INVERSE);
+
+    // --- 4. FOOTER (Status) ---
+    display->drawLine(0, FOOTER_LINE_Y, w - 1, FOOTER_LINE_Y, SSD1306_WHITE);
+    display->setCursor(0, FOOTER_TEXT_Y);
     
     if (isIsolated) {
-        display->setCursor(0, 120);
-        display->print("ISO");
+        display->print("!ISO!");
+    } else {
+        int p = (int)map((long)swarmEnergy, 0, 255, 0, 100);
+        if (p < 100) display->print(" "); 
+        if (p < 10)  display->print(" ");
+        display->print(p); 
+        display->print("%");
     }
 
-    // [NEW] CRT Scanline Effect (clamped)
-    static int scanY = 0;
-    static int scanDir = 1;
-    
-    // Move the scanline with clamping to valid range
-    scanY += scanDir;
-    if (scanY >= VISUAL_HEIGHT - 1) { scanY = VISUAL_HEIGHT - 1; scanDir = -1; }
-    else if (scanY <= 0) { scanY = 0; scanDir = 1; }
-
-    // Draw the line (Invert pixels where it passes for a ghostly look)
-    // Since we are rotated, X is the short side (0-31), Y is long (0-127)
-    display->drawFastHLine(0, scanY, 32, SSD1306_INVERSE);
-    
     display->display();
   }
 
@@ -230,19 +262,37 @@ private:
     }
   }
 
-  void renderGraph(VerticalGraph* graph, uint8_t xOffset) {
+  void renderGraph(VerticalGraph* graph, uint8_t xCenter, int yMin, int yMax) {
     if (!graph) return;
-    for (uint8_t i = 0; i < VISUAL_HEIGHT; i++) {
-      int16_t idx = graph->head - i;
-      if (idx < 0) idx += VISUAL_HEIGHT;
+    
+    int w = display->width();
+    // We loop through the SCREEN Y coordinates from Top to Bottom
+    for (int y = yMin; y < yMax; y++) {
+      
+      // Calculate how far back in the history buffer we need to look.
+      // yMax is the "newest" data, yMin is the "oldest" visible data.
+      int bufferOffset = (yMax - 1) - y;
+      
+      int16_t idx = graph->head - bufferOffset;
+      // Handle buffer wrap-around (circular buffer)
+      if (idx < 0) idx += VISUAL_HEIGHT; 
+      while(idx >= VISUAL_HEIGHT) idx -= VISUAL_HEIGHT;
+
       int8_t val = graph->values[idx];
-      uint8_t drawY = (VISUAL_HEIGHT - 1) - i;
-      applyOverlays(val, drawY);
+      
+      // Apply Glitch Effects
+      applyOverlays(val, y);
+
+      // Draw if value is valid (not a "dropout" value)
       if (val != -128) {
-        int x = xOffset + val;
-        if (x >= 0 && x < SCREEN_HW_WIDTH) {
-          display->drawPixel(x, drawY, SSD1306_WHITE);
-          if (currentGraphWidth > 1 && (x + 1) < SCREEN_HW_WIDTH) display->drawPixel(x + 1, drawY, SSD1306_WHITE);
+        int x = xCenter + val;
+        // Clamp X to actual display width so it doesn't attempt to draw outside framebuffer
+        if (x >= 0 && x < w) {
+          display->drawPixel(x, y, SSD1306_WHITE);
+          // Thicker line option
+          if (currentGraphWidth > 1 && (x + 1) < w) {
+            display->drawPixel(x + 1, y, SSD1306_WHITE);
+          }
         }
       }
     }
@@ -458,10 +508,11 @@ int8_t getSignalValue(SignalSource src) {
     case SRC_SILENCE: out = 0; break;
     case SRC_LOCAL_BREATH: 
       {
-        float idleWave = sin(millis() / 1500.0) * 2.0;
+        // Smoother, cleaner wave
+        float idleWave = sin(millis() / 1500.0) * 3.0; // Increased amplitude slightly
         float breathSpike = map((long)localPrimaryVal, 0, 30, 0, 12);
         out = (int8_t)(idleWave + breathSpike);
-        out += random(-1, 2); 
+        // NO JITTER ADDED
       } break;
     case SRC_SWARM_TRAFFIC: {
         int8_t noise = map(rawPacketCount, 0, 50, 0, 8);
@@ -473,7 +524,7 @@ int8_t getSignalValue(SignalSource src) {
     case SRC_SWARM_AVG:
       out = (int8_t)((swarmAvgVal - 50.0) / 10.0);
       out += (int8_t)(sin(millis() / 2000.0) * 1.5); 
-      out += random(-1, 2);
+      // NO JITTER ADDED
       break;
     case SRC_SINE_WAVE:
       out = (int8_t)(sin(millis() / 500.0) * 6.0);
@@ -746,5 +797,3 @@ void loop() {
     }
   }
 }
-
-
