@@ -139,6 +139,23 @@ Overlay activeOverlays[2];
 bool wasCrashing = false; 
 
 // ======================
+// 🛰️ CHANNEL / TRF SNIFER (ADDED)
+// ======================
+// Per-channel aggregation for RingNC compatibility & auto-lock
+volatile uint16_t channelCounts[14];   // index 1..13 used
+volatile int32_t channelRSSI[14];      // sum of rssi per channel
+volatile int reportPacketCount = 0;    // aggregated counter for reporting to RingNC
+volatile int totalRSSI = 0;            // aggregated RSSI for reporting
+volatile int currentChannel = 1;       // channel where the radio currently listens
+unsigned long lastChannelEval = 0;
+unsigned long channelLockUntil = 0;
+
+const unsigned long CHANNEL_EVAL_INTERVAL = 10000;  // evaluate every 10s
+const unsigned long CHANNEL_LOCK_DURATION  = 60000; // stay locked 60s after choosing
+const bool ENABLE_SWEEP_REPORT = false;             // set true to also sweep and send on all channels
+const unsigned long SWEEP_SEND_DELAY_MS = 10;       // delay between sends when sweeping
+
+// ======================
 // 🎨 RENDERER CLASS
 // ======================
 class OLEDRenderer {
@@ -306,7 +323,28 @@ OLEDRenderer renderer(&display);
 // ======================
 
 void IRAM_ATTR wifi_promiscuous_cb(void* buf, wifi_promiscuous_pkt_type_t type) {
+  // existing visual noise counter
   rawPacketCount++;
+
+  // aggregation for channel/trf logic
+  reportPacketCount++;
+
+  // Try to extract RSSI if packet struct is available
+  wifi_promiscuous_pkt_t *p = (wifi_promiscuous_pkt_t*)buf;
+  int rssi = 0;
+  if (p) {
+    rssi = p->rx_ctrl.rssi;
+    if (rssi < -95) rssi = -95;
+    if (rssi > -20) rssi = -20;
+    totalRSSI += rssi;
+  }
+
+  // bucket by current channel
+  int ch = currentChannel;
+  if (ch >= 1 && ch <= 13) {
+    channelCounts[ch]++;
+    channelRSSI[ch] += rssi;
+  }
 }
 
 void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
@@ -388,6 +426,75 @@ void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
 
     renderer.pushValue(&graphDataB, 12); 
     analogWrite(LED_PIN_4, (int)currentBrightness);
+  }
+}
+
+// ======================
+// CHANNEL EVALUATION / REPORTING HELPERS
+// ======================
+
+void evaluateChannels() {
+  unsigned long now = millis();
+  if (now - lastChannelEval < CHANNEL_EVAL_INTERVAL) return;
+  lastChannelEval = now;
+
+  int bestCh = 1;
+  uint32_t bestScore = 0;
+
+  noInterrupts();
+  for (int ch = 1; ch <= 13; ch++) {
+    uint32_t cnt = channelCounts[ch];
+    uint32_t avgRssi = 0;
+    if (channelCounts[ch] > 0) avgRssi = (uint32_t)((channelRSSI[ch] / channelCounts[ch]) + 100); // bias positive
+    uint32_t score = (cnt * 2) + avgRssi;
+    if (score > bestScore) { bestScore = score; bestCh = ch; }
+    channelCounts[ch] = 0;
+    channelRSSI[ch] = 0;
+  }
+  interrupts();
+
+  // If currently locked, don't switch until lock expires
+  if (channelLockUntil != 0 && millis() < channelLockUntil) {
+    return;
+  } else {
+    currentChannel = bestCh;
+    esp_wifi_set_channel(currentChannel, WIFI_SECOND_CHAN_NONE);
+    channelLockUntil = millis() + CHANNEL_LOCK_DURATION;
+
+    // Build and send Swarm STATE report with traffic aggregated
+    SwarmMessage reportMsg;
+    memset(&reportMsg, 0, sizeof(reportMsg));
+    reportMsg.header.version = SWARM_PROTO_VERSION;
+    reportMsg.header.msgType = MSG_STATE;
+    reportMsg.header.senderId = swarmId;
+    reportMsg.header.bootToken = bootToken;
+    reportMsg.data.state.temp = hasSensor ? sht31.readTemperature() : 0.0;
+    reportMsg.data.state.humidity = hasSensor ? sht31.readHumidity() : swarmAvgVal;
+    reportMsg.data.state.energy = (uint8_t)currentBrightness;
+    reportMsg.data.state.traffic = reportPacketCount;
+
+    esp_now_send(BROADCAST_ADDR, (uint8_t*)&reportMsg, sizeof(reportMsg));
+
+    if (ENABLE_SWEEP_REPORT) {
+      uint8_t baddr[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+      esp_now_peer_info_t peer = {};
+      memcpy(peer.peer_addr, baddr, 6);
+      peer.channel = 0;
+      peer.encrypt = false;
+      esp_now_add_peer(&peer);
+
+      for (int ch = 1; ch <= 13; ch++) {
+        esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
+        esp_now_send(baddr, (uint8_t*)&reportMsg, sizeof(reportMsg));
+        delay(SWEEP_SEND_DELAY_MS);
+      }
+      // return to locked channel
+      esp_wifi_set_channel(currentChannel, WIFI_SECOND_CHAN_NONE);
+    }
+
+    // reset aggregation counters
+    reportPacketCount = 0;
+    totalRSSI = 0;
   }
 }
 
@@ -485,7 +592,14 @@ void updateSensors() {
       msg.data.state.temp = 0; 
       msg.data.state.humidity = hasSensor ? sht31.readHumidity() : swarmAvgVal;
       msg.data.state.energy = (uint8_t)currentBrightness; 
-      msg.data.state.traffic = 0;  
+      msg.data.state.traffic = reportPacketCount; 
+      msg.data.state.traffic = msg.data.state.traffic; // explicit
+      msg.data.state.traffic = constrain(msg.data.state.traffic, 0, 65535);
+      msg.data.state.traffic = msg.data.state.traffic;
+
+      msg.data.state.traffic = reportPacketCount;
+      msg.data.state.traffic = (uint16_t)reportPacketCount;
+
       esp_now_send(BROADCAST_ADDR, (uint8_t *) &msg, sizeof(msg));
 
       if (isBioEvent) {
@@ -618,6 +732,9 @@ void mediumTick() {
 }
 
 void slowTick() {
+  // Evaluate channels early so locking & reporting happens before other announcements
+  evaluateChannels();
+
   isIsolated = (millis() - lastHeardMs) > 15000;
   
   // Random Glitch
@@ -766,6 +883,10 @@ void setup() {
     esp_wifi_set_promiscuous_rx_cb(&wifi_promiscuous_cb);
   }
   lastHeardMs = millis();
+
+  // Initialize sniffer channel to default 1
+  currentChannel = 1;
+  esp_wifi_set_channel(currentChannel, WIFI_SECOND_CHAN_NONE);
 
   runBootSequence();
   
