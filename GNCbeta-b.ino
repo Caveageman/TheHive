@@ -25,13 +25,31 @@
 #define LED_PIN_5  0   // Satellite / Event Fade
 #define BOOT_BUTTON 9
 
-#define SCREEN_HW_WIDTH  128
-#define SCREEN_HW_HEIGHT 32
-#define OLED_ADDR   0x3C
-#define VISUAL_WIDTH  32
-#define VISUAL_HEIGHT 128
 
-#define MASTER_BRIGHTNESS 255
+// 🧬 GENETIC PARAMETERS
+struct GeneticParams {
+    // Graph Sources (20-29)
+    uint8_t graphSourceA = 1;      // 1=Sensor, 2=Noise, 3=Energy, 4=Drift, 5=Mood, 6=Tempo
+    uint8_t graphSourceB = 2;
+    
+    // LED Assignments (30-39)
+    uint8_t pinHeartbeat = 2;      // Physical pin index (0-4)
+    uint8_t pinBio = 4;
+    uint8_t pinSync = 0;
+    uint8_t pinData = 3;
+    
+    // Visual Tuning (40-49)
+    uint8_t masterBrightness = 255;
+    uint8_t graphWidthMin = 1;
+    uint8_t graphWidthMax = 4;
+    
+    // Behavior Tuning (50-59)
+    uint8_t driftSensitivity = 100;  // 0-255: How fast drift accumulates
+    uint8_t energyDecay = 100;        // 0-255: How fast energy drains
+    uint8_t confusionThreshold = 150; // 0-255: Chaos mode trigger
+} genes;
+
+#define MASTER_BRIGHTNESS genes.masterBrightness
 
 // ======================
 // 📜 SWARM PROTOCOL V4 (Packed)
@@ -46,6 +64,7 @@ enum MsgType : uint8_t {
     MSG_EVENT       = 4,
     MSG_STATE       = 5,
     MSG_ANNOUNCE    = 6,
+    MSG_PARAM       = 7,  // 🧬 NEW: Parameter updates
 };
 
 struct __attribute__((packed)) SwarmHeader {
@@ -82,6 +101,12 @@ struct __attribute__((packed)) MsgAnnounce {
     uint8_t role; uint8_t influence;      
 };
 
+struct __attribute__((packed)) MsgParam {
+    uint16_t targetId;  // 0 = All Nodes, >0 = Specific Node
+    uint8_t paramId;
+    uint8_t value;
+};
+
 struct __attribute__((packed)) SwarmMessage {
     SwarmHeader header;
     union {
@@ -89,6 +114,7 @@ struct __attribute__((packed)) SwarmMessage {
         MsgEvent    event;
         MsgState    state;
         MsgAnnounce announce;
+        MsgParam    param;
     } data;
 };
 
@@ -108,6 +134,10 @@ float smoothTemp = 0;
 float smoothHum = 0;
 float humBaseline = 0;
 
+// Add global variables
+bool settingsChanged = false;
+unsigned long lastSettingsChange = 0;
+
 // Swarm Logic
 uint32_t bootToken;
 uint16_t swarmId = 0; 
@@ -118,7 +148,7 @@ float confusionLevel = 0.0;
 // Radio State
 bool isBroadcasting = false;
 unsigned long broadcastStartTime = 0;
-unsigned long broadcastDuration = 150; // Variable duration for sticky events
+unsigned long broadcastDuration = 150;
 volatile int alienPacketRate = 0; 
 volatile int rawPacketCount = 0;  
 
@@ -127,7 +157,7 @@ enum IdState { ID_UNASSIGNED, ID_CLAIMING, ID_ASSIGNED };
 IdState nodeState = ID_UNASSIGNED;
 uint16_t candidateId = 0;
 unsigned long stateTimer = 0;
-unsigned long lastDataRx = 0; // Timer for the Data LED
+unsigned long lastDataRx = 0;
 
 // Sensor / Autonomic State
 bool hasOLED = false;
@@ -139,11 +169,7 @@ unsigned long lastHeardMs = 0;
 float avgHum = 0.0;        
 bool isBioEvent = false;   
 unsigned long bioEventEnd = 0;
-unsigned long lastBlink1 = 0; // Sync Timer
-
-// Event Probabilities (From GNCalpha)
-#define BASE_CHANCE_CRASH     5      
-#define BASE_CHANCE_SATELLITE 15 
+unsigned long lastBlink1 = 0;
 
 float axisEnergy   = 180.0;
 float axisMood     = 128.0; 
@@ -155,9 +181,9 @@ float currentBrightness = (float)MASTER_BRIGHTNESS;
 
 uint8_t currentGraphWidth = 2; 
 
-// Swarm Field (BLE-derived atmosphere)
-float swarmTraffic = 0.0;   // 0..1
-float swarmEnergy  = 0.0;   // 0..1
+// Swarm Field
+float swarmTraffic = 0.0;
+float swarmEnergy  = 0.0;
 
 uint16_t advertsThisWindow = 0;
 int32_t  rssiAccum = 0;
@@ -165,6 +191,12 @@ uint16_t rssiSamples = 0;
 
 // Map logical index (0-4) to physical pins
 const int LED_PINS[5] = { LED_PIN_1, LED_PIN_2, LED_PIN_3, LED_PIN_4, LED_PIN_5 };
+
+// Helper function to safely get pin
+int getSafePin(uint8_t geneIndex) {
+    if (geneIndex >= 5) return LED_PINS[0]; // Default to safe pin
+    return LED_PINS[geneIndex];
+}
 
 // Forward Declarations
 void triggerCrash(uint8_t intensity);
@@ -192,7 +224,6 @@ class OLEDRenderer {
 public:
   OLEDRenderer(Adafruit_SSD1306* disp) : display(disp) {}
   
-  // State Flags
   bool chaosMode = false;
   bool bioMode = false;      
   bool crashMode = false;     
@@ -227,22 +258,19 @@ public:
   void render() {
     display->clearDisplay();
 
-    // 1. PRIORITY: CRASH ANIMATION
     if (crashMode) {
         renderCrashVisuals();
         display->display();
         return;
     }
 
-    // 2. PRIORITY: SATELLITE ANIMATION
     if (satelliteMode) {
         renderSatelliteVisuals();
         display->display();
         return;
     }
 
-    // 3. NORMAL RENDER
-    display->invertDisplay(false); // Ensure we aren't stuck inverted
+    display->invertDisplay(false);
     int w = display->width();
     int h = display->height();
 
@@ -261,7 +289,7 @@ public:
         display->print(swarmId);
     }
     
-    if (confusionLevel > 0.5) display->drawChar(24, 0, '!', SSD1306_WHITE, SSD1306_BLACK, 1);
+    if (confusionLevel > (genes.confusionThreshold / 255.0)) display->drawChar(24, 0, '!', SSD1306_WHITE, SSD1306_BLACK, 1);
     else if ((millis() / 200) % 2 == 0) display->fillCircle(26, 3, 2, SSD1306_WHITE);
     
     display->drawLine(0, HEADER_LINE_Y, w - 1, HEADER_LINE_Y, SSD1306_WHITE);
@@ -302,7 +330,7 @@ public:
     }
 
     // Chaos Pass
-    if (chaosMode || confusionLevel > 0.6) {
+    if (chaosMode || confusionLevel > (genes.confusionThreshold / 255.0)) {
         if (random(0,10) > (8 - (confusionLevel*4))) { 
              int y = random(0, h);
              display->drawFastHLine(0, y, w, SSD1306_INVERSE);
@@ -322,7 +350,6 @@ private:
   Overlay* overlays = nullptr;
   uint8_t overlayCount = 0;
 
-  // --- 💥 NEW CRASH VISUAL ---
   void renderCrashVisuals() {
       if ((millis() / 50) % 2 == 0) display->invertDisplay(true);
       else display->invertDisplay(false);
@@ -340,7 +367,6 @@ private:
       display->print(random(100, 999));
   }
 
-  // --- 🛰️ NEW SATELLITE VISUAL ---
   void renderSatelliteVisuals() {
       display->invertDisplay(false);
       int w = display->width();
@@ -356,7 +382,7 @@ private:
       if (scanX > 0 && scanX < w) {
           display->drawLine(scanX, random(0, h), scanX-4, random(0, h), SSD1306_WHITE);
       }
-      if ((millis() / 200) % 2 == 0) { // Blink
+      if ((millis() / 200) % 2 == 0) {
           display->fillRect(0, 0, w, 9, SSD1306_BLACK); 
           display->setCursor(2, 1);
           display->print("SAT_LK");
@@ -426,6 +452,47 @@ private:
 OLEDRenderer renderer(&display);
 
 // ======================
+// 🧬 DATA SOURCE ROUTER
+// ======================
+int8_t readSource(uint8_t srcId) {
+    switch(srcId) {
+        case 1: { // Sensor (Humidity)
+            float idle = sin(millis()/1500.0) * 4.0;
+            float sensorSpike = 0;
+            if (hasSensor) {
+                float diff = sht31.readHumidity() - humBaseline;
+                if (diff > 2.0) sensorSpike = diff * 4.0; 
+                if (sensorSpike > 8) sensorSpike = 8;
+                if (sensorSpike < 0) sensorSpike = 0;
+                humBaseline = (humBaseline * 0.99) + (sht31.readHumidity() * 0.01);
+            }
+            if (isBioEvent) sensorSpike += 8; 
+            return (int8_t)(idle + sensorSpike);
+        }
+        case 2: { // Radio Noise
+            int8_t noise = map(alienPacketRate, 0, 5, 0, 8); 
+            if (isBroadcasting) noise += 4;
+            int jitter = random(0, 3); 
+            if (rawPacketCount > 0) { 
+                noise += rawPacketCount;
+                rawPacketCount = 0;
+            }
+            return random(0, noise + jitter);
+        }
+        case 3: // Energy
+            return (int8_t)map((long)axisEnergy, 0, 255, -16, 16);
+        case 4: // Drift
+            return (int8_t)map((long)axisDrift, 0, 255, -16, 16);
+        case 5: // Mood
+            return (int8_t)map((long)axisMood, 0, 255, -16, 16);
+        case 6: // Tempo
+            return (int8_t)map((long)axisTempo, 0, 255, -16, 16);
+        default:
+            return 0;
+    }
+}
+
+// ======================
 // 📡 BLE TRANSMITTER
 // ======================
 void triggerBroadcast(MsgType type, SwarmMessage* msgOverride = nullptr) {
@@ -434,14 +501,12 @@ void triggerBroadcast(MsgType type, SwarmMessage* msgOverride = nullptr) {
 
     SwarmMessage outMsg;
     
-    // 1. If we have manual data (like a Crash Event), copy it in
     if (msgOverride) {
         outMsg = *msgOverride; 
     } else {
         memset(&outMsg, 0, sizeof(SwarmMessage));
     }
 
-    // 2. 🔒 MANDATORY HEADER STAMPING 
     outMsg.header.version = SWARM_PROTO_VERSION;
     outMsg.header.msgType = type;
     outMsg.header.senderId = swarmId;
@@ -450,7 +515,6 @@ void triggerBroadcast(MsgType type, SwarmMessage* msgOverride = nullptr) {
     outMsg.header.groupId = 0;
     outMsg.header.context = (uint8_t)(confusionLevel * 255);
 
-    // 3. Fill in Auto-State data if needed
     if (type == MSG_STATE && !msgOverride) {
         float humVal = hasSensor ? sht31.readHumidity() : swarmAvgVal;
         outMsg.data.state.humidity_x10 = (uint16_t)(humVal * 10);
@@ -465,7 +529,6 @@ void triggerBroadcast(MsgType type, SwarmMessage* msgOverride = nullptr) {
         outMsg.data.id.targetId = candidateId;
     }
 
-    // 4. Calculate Payload Size
     size_t payloadSize = 0;
     switch(type) {
         case MSG_STATE: payloadSize = sizeof(MsgState); break;
@@ -473,10 +536,10 @@ void triggerBroadcast(MsgType type, SwarmMessage* msgOverride = nullptr) {
         case MSG_ID_CLAIM: payloadSize = sizeof(MsgId); break;
         case MSG_ANNOUNCE: payloadSize = sizeof(MsgAnnounce); break;
         case MSG_ID_CONFLICT: payloadSize = sizeof(MsgId); break; 
+        case MSG_PARAM: payloadSize = sizeof(MsgParam); break;
         default: payloadSize = 0; break;
     }
 
-    // 5. Serialize to BLE
     size_t totalLen = sizeof(SwarmHeader) + payloadSize;
     uint8_t buffer[50];
     uint16_t id = HIVE_MANUFACTURER_ID;
@@ -498,15 +561,50 @@ void triggerBroadcast(MsgType type, SwarmMessage* msgOverride = nullptr) {
     isBroadcasting = true;
     broadcastStartTime = millis();
 
-    // 🔥 NEW: PRIORITY DURATION
-    if (type == MSG_EVENT || type == MSG_ID_CONFLICT) {
-        broadcastDuration = 800; // Shout louder for events
+    if (type == MSG_EVENT || type == MSG_ID_CONFLICT || type == MSG_PARAM) {
+        broadcastDuration = 800;
     } else {
-        broadcastDuration = 150; // Standard Heartbeat
+        broadcastDuration = 150;
     }
 
-    // 6. Visual Feedback
-    analogWrite(LED_PIN_1, (int)currentBrightness);
+    // FIXED: Changed array access [] to function call ()
+    analogWrite(getSafePin(genes.pinSync), (int)currentBrightness);
+}
+
+// ======================
+// 🧬 PARAMETER HANDLER
+// ======================
+void setParameter(uint8_t paramId, uint8_t value) {
+    switch(paramId) {
+        // Graph Sources (20-29)
+        case 20: genes.graphSourceA = constrain(value, 1, 6); break;
+        case 21: genes.graphSourceB = constrain(value, 1, 6); break;
+        
+        // LED Assignments (30-39)
+        case 30: genes.pinHeartbeat = constrain(value, 0, 4); break;
+        case 31: genes.pinBio = constrain(value, 0, 4); break;
+        case 32: genes.pinSync = constrain(value, 0, 4); break;
+        case 33: genes.pinData = constrain(value, 0, 4); break;
+        
+        // Visual Tuning (40-49)
+        case 40: genes.masterBrightness = value; currentBrightness = value; break;
+        case 41: genes.graphWidthMin = constrain(value, 1, 4); break;
+        case 42: genes.graphWidthMax = constrain(value, 1, 4); break;
+        
+        // Behavior Tuning (50-59)
+        case 50: genes.driftSensitivity = value; break;
+        case 51: genes.energyDecay = value; break;
+        case 52: genes.confusionThreshold = value; break;
+        
+        default: 
+            Serial.printf("⚠️ Unknown param: %d\n", paramId);
+            return;
+    }
+    
+    Serial.printf("🧬 SET Param %d = %d\n", paramId, value);
+    
+    settingsChanged = true;
+    lastSettingsChange = millis();
 }
 
 // ======================
@@ -541,22 +639,18 @@ void parseSwarmPacket(const uint8_t* rawData, int len, int rssi) {
     lastSeenSeqId[in.header.senderId] = current;
     lastHeardMs = millis();
     
-    // --- HANDLING MSG TYPES ---
     if (in.header.msgType == MSG_STATE) {
         Serial.printf("[RX] #%d STATE | E:%d M:%d\n", in.header.senderId, in.data.state.energy, in.data.state.mood);
         
-        // 📉 TUNING: Reduced Influence (0.02) for stability
         float influence = 0.02;
         axisEnergy = (axisEnergy * (1.0-influence)) + ((float)in.data.state.energy * influence);
         axisMood   = (axisMood   * (1.0-influence)) + ((float)in.data.state.mood * influence);
-        
-        // 🔥 NEW: Tempo Syncing
         axisTempo  = (axisTempo  * (1.0-influence)) + ((float)in.data.state.tempo * influence);
 
         renderer.pushValue(&graphDataB, 12);
         
-        // Data Activity LED
-        analogWrite(LED_PIN_4, (int)currentBrightness);
+        // FIXED: Changed array access [] to function call ()
+        analogWrite(getSafePin(genes.pinData), (int)currentBrightness);
         lastDataRx = millis(); 
     }
     
@@ -564,20 +658,18 @@ void parseSwarmPacket(const uint8_t* rawData, int len, int rssi) {
         uint8_t evId = in.data.event.eventId;
         Serial.printf("[RX] #%d EVENT | ID:%d Intensity:%d\n", in.header.senderId, evId, in.data.event.intensity);
 
-        if (evId == 5) { // BIO HAZARD
+        if (evId == 5) {
              isBioEvent = true;
              bioEventEnd = millis() + in.data.event.durationMs;
              renderer.bioIntensity = 255; 
              renderer.bioMode = true;     
              renderer.pushValue(&graphDataA, 127); 
         }
-        else if (evId == 1) { // CRASH
+        else if (evId == 1) {
             triggerCrash(in.data.event.intensity);
         }
-        else if (evId == 2) { // SATELLITE
+        else if (evId == 2) {
              triggerSatellite();
-             
-             // 🔥 NEW: Satellite sync heals drift
              axisDrift -= 50.0f;
              if(axisDrift < 0) axisDrift = 0;
              Serial.printf("🛰️ SAT SYNC: Healed to %.1f\n", axisDrift);
@@ -589,6 +681,27 @@ void parseSwarmPacket(const uint8_t* rawData, int len, int rssi) {
         lastBlink1 = millis(); 
         renderer.pushValue(&graphDataB, 20); 
     }
+    
+    else if (in.header.msgType == MSG_PARAM) {
+        uint16_t target = in.data.param.targetId;
+        
+        // Check: Is it for EVERYONE (0) or specifically ME (swarmId)?
+        if (target == 0 || target == swarmId) {
+            Serial.printf("[RX] #%d PARAM | Target:%d | %d=%d\n", 
+                in.header.senderId, target, in.data.param.paramId, in.data.param.value);
+                
+            setParameter(in.data.param.paramId, in.data.param.value);
+            
+            // Optional: Visual confirmation that *I* accepted the command
+            // FIXED: Changed array access [] to function call () for LED_PINS access or just use getSafePin
+            analogWrite(LED_PINS[genes.pinData], 255); 
+            delay(50);
+            analogWrite(LED_PINS[genes.pinData], 0);
+        } else {
+            Serial.printf("[RX] Ignored Param for Node #%d (I am #%d)\n", target, swarmId);
+        }
+    }
+    // FIXED: Removed extra closing brace here that was closing the function early
 
     if (in.header.msgType == MSG_ID_CLAIM) {
         if (nodeState == ID_ASSIGNED && in.data.id.targetId == swarmId) {
@@ -619,11 +732,9 @@ class MyAdvertisedDeviceCallbacks: public BLEAdvertisedDeviceCallbacks {
             }
         }
         if (!isSwarm) {
-        alienPacketRate++;
-
-        // 📉 TUNING: Reduced Alien Sensitivity
-        axisDrift += 0.05f;
-        if (axisDrift > 255) axisDrift = 255;
+            alienPacketRate++;
+            axisDrift += 0.05f * (genes.driftSensitivity / 100.0f);
+            if (axisDrift > 255) axisDrift = 255;
         }
     }
 };
@@ -631,76 +742,49 @@ class MyAdvertisedDeviceCallbacks: public BLEAdvertisedDeviceCallbacks {
 // ======================
 // 🔄 LOGIC TICKS
 // ======================
-int8_t getSignalValue(uint8_t src) {
-  int8_t out = 0;
-  
-  if (src == 1) { 
-      float idle = sin(millis()/1500.0) * 4.0;
-      float sensorSpike = 0;
-      if (hasSensor) {
-          float diff = sht31.readHumidity() - humBaseline;
-          if (diff > 2.0) sensorSpike = diff * 4.0; 
-          if (sensorSpike > 8) sensorSpike = 8;
-          if (sensorSpike < 0) sensorSpike = 0;
-          humBaseline = (humBaseline * 0.99) + (sht31.readHumidity() * 0.01);
-      }
-      if (isBioEvent) sensorSpike += 8; 
-      out = (int8_t)(idle + sensorSpike);
-  } 
-  
-  else if (src == 2) { 
-      int8_t noise = map(alienPacketRate, 0, 5, 0, 8); 
-      if (isBroadcasting) noise += 4;
-      int jitter = random(0, 3); 
-      if (rawPacketCount > 0) { 
-          noise += rawPacketCount;
-          rawPacketCount = 0;
-      }
-      out = random(0, noise + jitter);
-  }
-  return out;
-}
-
 void fastTick() {
-    renderer.chaosMode = (confusionLevel > 0.6) || (axisMood < 50 && random(0,100) > 95);
+    renderer.chaosMode = (confusionLevel > (genes.confusionThreshold / 255.0)) || (axisMood < 50 && random(0,100) > 95);
     
-    // --- Bio Event Logic ---
     if (isBioEvent) {
        renderer.bioMode = true;
        long timeLeft = bioEventEnd - millis();
        if (timeLeft > 0) {
            renderer.bioIntensity = map(timeLeft, 0, 5000, 50, (int)currentBrightness);
            float pulse = (exp(sin(millis()/500.0*PI)) - 0.36787944)*108.0;
-           analogWrite(LED_PIN_5, (int)pulse);
+           // FIXED: Changed array access [] to function call ()
+           analogWrite(getSafePin(genes.pinBio), (int)pulse);
        } else isBioEvent = false;
     } else {
         renderer.bioMode = false;
-        if (!isBroadcasting) analogWrite(LED_PIN_5, 0);
+        // FIXED: Changed array access [] to function call ()
+        if (!isBroadcasting) analogWrite(getSafePin(genes.pinBio), 0);
     }
 
-    // --- Heartbeat Breath ---
+    // Heartbeat Breath
     float tempoSpeed = map(axisTempo, 0, 255, 3000, 500);
     float rawBreath = (exp(sin(millis()/tempoSpeed*PI)) - 0.36787944);
     float breath = (rawBreath / 2.35) * currentBrightness; 
-    analogWrite(LED_PIN_3, (int)breath);
+    // FIXED: Changed array access [] to function call () (This one was actually already correct in source but good to check)
+    analogWrite(getSafePin(genes.pinHeartbeat), (int)breath);
     
-    // --- Sync Blink Logic ---
+    // Sync Blink Logic
     if (!isBroadcasting) {
-        if (millis() - lastBlink1 < 100) analogWrite(LED_PIN_1, (int)currentBrightness);
-        else analogWrite(LED_PIN_1, 0);
+        // FIXED: Changed array access [] to function call ()
+        if (millis() - lastBlink1 < 100) analogWrite(getSafePin(genes.pinSync), (int)currentBrightness);
+        else analogWrite(getSafePin(genes.pinSync), 0);
     }
 
-    // --- Data Blink Logic ---
-    if (millis() - lastDataRx > 50) analogWrite(LED_PIN_4, 0);
+    // Data Blink Logic
+    // FIXED: Changed array access [] to function call ()
+    if (millis() - lastDataRx > 50) analogWrite(getSafePin(genes.pinData), 0);
 
-    // --- Overlays ---
     for(int i=0; i<2; i++) if(activeOverlays[i].ttl > 0) activeOverlays[i].ttl--;
     renderer.render();
 }
 
 void mediumTick() {
-    renderer.pushValue(&graphDataA, getSignalValue(1)); 
-    renderer.pushValue(&graphDataB, getSignalValue(2)); 
+    renderer.pushValue(&graphDataA, readSource(genes.graphSourceA)); 
+    renderer.pushValue(&graphDataB, readSource(genes.graphSourceB)); 
     
     if (hasSensor) {
         float h = sht31.readHumidity();
@@ -719,78 +803,58 @@ void mediumTick() {
 
 void slowTick() {
   bool isolated = (millis() - lastHeardMs) > 4000;
+  isIsolated = isolated;
 
-  // --- 1. Energy Logic ---
+  // Energy Logic (with genetic scaling)
   axisEnergy += (swarmEnergy * 255.0f - axisEnergy) * 0.01f;
-  axisEnergy -= isolated ? 2.0f : 0.5f;
+  float decayFactor = (genes.energyDecay / 100.0f);
+  axisEnergy -= isolated ? (2.0f * decayFactor) : (0.5f * decayFactor);
   
-  // SAFETY CUTOFF: If Drift is critical (>220), force Energy down (Coma)
-  if (axisDrift > 220) {
-      axisEnergy -= 20.0f; 
-  }
+  if (axisDrift > 220) axisEnergy -= 20.0f;
   axisEnergy = constrain(axisEnergy, 0.0f, 255.0f);
 
-  // --- 2. Brightness Mapping ---
-  float energyFactor = map(axisEnergy, 0, 255, 10, 255) / 255.0;
-  currentBrightness = MASTER_BRIGHTNESS * energyFactor;
+  // Brightness Mapping
+  float energyFactor = map(axisEnergy, 0, 255, 10, (int)genes.masterBrightness) / 255.0;
+  currentBrightness = genes.masterBrightness * energyFactor;
 
-  // --- 3. ❤️ DYNAMIC TEMPO (The Arrhythmia Logic) ---
+  // Dynamic Tempo
   float targetTempo;
   if (axisDrift > 180) {
-      targetTempo = random(40, 220); // Chaos Mode
-  } 
-  else {
-      targetTempo = map(axisEnergy, 0, 255, 40, 240); // Linked Mode
+      targetTempo = random(40, 220);
+  } else {
+      targetTempo = map(axisEnergy, 0, 255, 40, 240);
   }
   axisTempo += (targetTempo - axisTempo) * 0.15f;
   axisTempo += sin(millis() * 0.00025f) * 4.0f;
   axisTempo = constrain(axisTempo, 0.0f, 255.0f);
 
-  // --- 4. Cohesion Logic ---
+  // Cohesion Logic
   axisCohesion += (swarmTraffic * 255.0f - axisCohesion) * 0.04f;
   if (isolated) axisCohesion -= 0.8f;
   axisCohesion = constrain(axisCohesion, 0.0f, 255.0f);
 
-  // --- 5. Drift Logic (Entropy) ---
-  axisDrift += isolated ? 1.2f : 0.0f;
-  
-  // 📉 TUNING: Slower Aging (0.01 instead of 0.05)
-  axisDrift += 0.01f; 
+  // Drift Logic (with genetic scaling)
+  float driftFactor = (genes.driftSensitivity / 100.0f);
+  axisDrift += isolated ? (1.2f * driftFactor) : 0.0f;
+  axisDrift += (0.01f * driftFactor);
 
-  // Healing Sleep
   if (axisEnergy < 80 && !isolated) {
       axisDrift -= 1.5f; 
   }
 
-  // Paranoia
-  if (axisCohesion > 200) axisDrift += 0.2f;
-
+  if (axisCohesion > 200) axisDrift += (0.2f * driftFactor);
   axisDrift += confusionLevel * 1.5f;
   axisDrift = constrain(axisDrift, 0.0f, 255.0f);
 
-  // --- 6. Mood (Color) Logic ---
-  // 1. Calculate Volatility (How unstable are we?)
-  // Base volatility is now higher (was 3, now 8)
+  // Mood Logic
   int volatility = 8;
-
-  // If we are High Energy, we become "Manic" (Double volatility)
-  // This causes rapid color shifting when the swarm is excited
   if (axisEnergy > 200) volatility = 16;
-
-  // If we are High Drift, we become "Erratic" (Triple volatility)
   if (axisDrift > 150) volatility = 24;
-
-  // 2. Apply the Random Walk
   axisMood += random(-volatility, volatility + 1);
-
-  // 3. The "Tides" (Continuous shifting)
-  // Gently pushes mood up and down every ~30 seconds.
-  // This ensures they don't get stuck on "Blue" forever.
   axisMood += sin(millis() * 0.0002) * 5.0;
-
   axisMood = constrain(axisMood, 0.0f, 255.0f);
-  // --- 7. Events (With Broadcasts) ---
-  // 📉 TUNING: Raised threshold to 180 (Harder to crash)
+
+  // Events
   if (axisDrift > 180 && random(5000) < axisDrift) {
       triggerCrash(100 + axisDrift / 2);
       
@@ -813,37 +877,44 @@ void slowTick() {
       triggerBroadcast(MSG_EVENT, &satMsg);
   }
 
-  currentGraphWidth = map(axisCohesion, 0, 255, 1, 4);
-  currentGraphWidth = constrain(currentGraphWidth, 1, 4);
+  currentGraphWidth = map(axisCohesion, 0, 255, genes.graphWidthMin, genes.graphWidthMax);
+  currentGraphWidth = constrain(currentGraphWidth, genes.graphWidthMin, genes.graphWidthMax);
+
+  // In loop() (slowTick or standalone):
+  if (settingsChanged && (millis() - lastSettingsChange > 3000)) {
+    Serial.println("💾 Committing settings to Flash...");
+    prefs.begin("genes", false);
+    prefs.putBytes("params", &genes, sizeof(genes));
+    prefs.end();
+    settingsChanged = false;
+  }
 }
 
-
-
-// ORIGINAL BOOT SEQ
 void runBootSequence() {
   if (!hasOLED) return;
   display.clearDisplay(); display.display(); delay(200);
 
   display.setCursor(0, 10); display.println("BOOT.."); display.display(); 
-  analogWrite(LED_PIN_1, (int)currentBrightness); delay(150); analogWrite(LED_PIN_1, 0);
+  // FIXED: Changed array access [] to function call ()
+  analogWrite(getSafePin(0), (int)currentBrightness); delay(150); analogWrite(getSafePin(0), 0);
 
   display.setCursor(0, 30); display.println("MEM OK"); display.display(); 
-  analogWrite(LED_PIN_2, (int)currentBrightness); delay(150); analogWrite(LED_PIN_2, 0);
+  // FIXED: Changed array access [] to function call ()
+  analogWrite(getSafePin(1), (int)currentBrightness); delay(150); analogWrite(getSafePin(1), 0);
 
   display.setCursor(0, 50); display.println("RADIO"); display.display(); 
-  analogWrite(LED_PIN_3, (int)currentBrightness); delay(150); analogWrite(LED_PIN_3, 0);
+  // FIXED: Changed array access [] to function call ()
+  analogWrite(getSafePin(2), (int)currentBrightness); delay(150); analogWrite(getSafePin(2), 0);
 
   display.setCursor(0, 70); display.println("HIVE.."); display.display(); 
-  analogWrite(LED_PIN_4, (int)currentBrightness); delay(150); analogWrite(LED_PIN_4, 0);
-  analogWrite(LED_PIN_5, (int)currentBrightness); delay(150); analogWrite(LED_PIN_5, 0); 
+  // FIXED: Changed array access [] to function call ()
+  analogWrite(getSafePin(3), (int)currentBrightness); delay(150); analogWrite(getSafePin(3), 0);
+  analogWrite(getSafePin(4), (int)currentBrightness); delay(150); analogWrite(getSafePin(4), 0); 
 
   delay(400);
   display.clearDisplay(); display.display();
 }
 
-// -----------------------------
-// 🚨 CRASH & SATELLITE STATES
-// -----------------------------
 struct CrashState {
     bool active = false;
     unsigned long startTime = 0;
@@ -864,7 +935,7 @@ void triggerCrash(uint8_t intensity) {
     crash.startTime = millis();
     crash.intensity = intensity;
     renderer.crashMode = true; 
-    Serial.printf("Crash triggered: intensity=%d\n", intensity);
+    Serial.printf("💥 Crash: intensity=%d\n", intensity);
 }
 
 void handleCrash() {
@@ -873,15 +944,17 @@ void handleCrash() {
 
     if (elapsed < crash.intensity * 20) {
         for (int i = 0; i < 5; i++) {
-            analogWrite(LED_PINS[i], random(0, 2) ? (int)currentBrightness : 0);
+            // FIXED: Changed array access [] to function call ()
+            analogWrite(getSafePin(i), random(0, 2) ? (int)currentBrightness : 0);
         }
     } else {
         crash.active = false;
         renderer.crashMode = false; 
-        for (int i = 0; i < 5; i++) analogWrite(LED_PINS[i], 0);
+        // FIXED: Changed array access [] to function call ()
+        for (int i = 0; i < 5; i++) analogWrite(getSafePin(i), 0);
         
         axisEnergy = 0; 
-        currentBrightness = MASTER_BRIGHTNESS * 0.05; 
+        currentBrightness = genes.masterBrightness * 0.05; 
         runBootSequence();
         axisDrift = 0; 
         confusionLevel = 0;
@@ -924,30 +997,31 @@ void handleSatellite() {
           brightness = (val * val) / max(1, (int)currentBrightness); 
       }
       
-      analogWrite(LED_PIN_5, brightness);
+      // FIXED: Changed array access [] to function call ()
+      analogWrite(getSafePin(genes.pinBio), brightness);
 
       if (satellite.progress > fadeIn && satellite.progress < (fadeIn + hold)) {
           if (!renderer.satelliteMode) {
               renderer.satelliteMode = true; 
-              analogWrite(LED_PIN_4, (int)currentBrightness); 
+              // FIXED: Changed array access [] to function call ()
+              analogWrite(getSafePin(genes.pinData), (int)currentBrightness); 
           }
       } else {
           if (renderer.satelliteMode) {
               renderer.satelliteMode = false; 
-              analogWrite(LED_PIN_4, 0); 
+              // FIXED: Changed array access [] to function call ()
+              analogWrite(getSafePin(genes.pinData), 0); 
           }
       }
   } else {
     satellite.active = false;
     renderer.satelliteMode = false; 
-    analogWrite(LED_PIN_5, 0);
-    analogWrite(LED_PIN_4, 0);
+    // FIXED: Changed array access [] to function call ()
+    analogWrite(getSafePin(genes.pinBio), 0);
+    analogWrite(getSafePin(genes.pinData), 0);
   }
 }
 
-// ======================
-// 🚀 SETUP
-// ======================
 void setup() {
     Serial.begin(115200);
     Wire.begin(I2C_SDA, I2C_SCL);
@@ -957,6 +1031,16 @@ void setup() {
     pinMode(LED_PIN_5, OUTPUT); pinMode(BOOT_BUTTON, INPUT_PULLUP);
 
     bootToken = esp_random();
+
+    // Load genetic parameters
+    prefs.begin("genes", false);
+    size_t loadedSize = prefs.getBytes("params", &genes, sizeof(genes));
+    if (loadedSize == sizeof(genes)) {
+        Serial.println("🧬 Loaded genetic parameters from flash");
+    } else {
+        Serial.println("🧬 Using default genetic parameters");
+    }
+    prefs.end();
 
     renderer.begin(); 
     hasOLED = true; 
@@ -987,10 +1071,13 @@ void setup() {
         swarmId = (uint16_t)random(1, 254);
         prefs.putUShort("swarmId", swarmId);
         nodeState = ID_ASSIGNED;
-        Serial.printf("🆕 Identity Crisis Solved: I am now Node %d\n", swarmId);
+        Serial.printf("🆕 Identity: Node %d\n", swarmId);
     }
     
-    analogWrite(LED_PIN_1, (int)currentBrightness); delay(100); analogWrite(LED_PIN_1, 0);
+    // FIXED: Changed array access [] to function call ()
+    analogWrite(getSafePin(genes.pinSync), (int)currentBrightness); 
+    delay(100); 
+    analogWrite(getSafePin(genes.pinSync), 0);
 }
 
 void updateSwarmField() {
@@ -1009,40 +1096,33 @@ void updateSwarmField() {
   rssiSamples = 0;
 }
 
-// ======================
-// 🔄 LOOP 
-// ======================
 void loop() {
     unsigned long now = millis();
 
-   // 1. BROADCAST TIMING (Using Variable Duration)
    if (isBroadcasting) {
         if (now - broadcastStartTime > broadcastDuration) { 
             isBroadcasting = false;
             pAdvertising->stop();
             pBLEScan->clearResults();
             pBLEScan->start(0, nullptr); 
-            analogWrite(LED_PIN_1, 0); 
+            // FIXED: Changed array access [] to function call ()
+            analogWrite(getSafePin(genes.pinSync), 0); 
         }
     }
 
-    // 2. ALIEN NOISE
     if (alienPacketRate > 0) {
         rawPacketCount += alienPacketRate; 
         alienPacketRate = 0; 
     }
 
-    // 3. SYSTEM TICKS
     static unsigned long lastFast=0, lastMed=0, lastSlow=0;
     if (now - lastFast >= 50)  { lastFast = now; fastTick(); }
     if (now - lastMed  >= 80)  { lastMed  = now; mediumTick(); }
     if (now - lastSlow >= 400) { lastSlow = now; slowTick(); }
 
-    // 4. VISUAL HANDLERS
     handleCrash();       
     handleSatellite();   
 
-    // 5. HEARTBEAT BROADCAST
     static unsigned long lastBroadcastTime = 0;
     long broadcastInterval = map(axisTempo, 0, 255, 4000, 250);
 
@@ -1053,7 +1133,7 @@ void loop() {
         renderer.pushValue(&graphDataB, 24); 
     }
 
-    // 6. SERIAL COMMANDS
+    // Serial Commands
     if (Serial.available()) {
         char c = Serial.read();
         if (c=='c') { 
@@ -1082,6 +1162,42 @@ void loop() {
             Serial.printf("ID: %d | Role: %s\n", swarmId, nodeState==ID_ASSIGNED?"Active":"Search");
             Serial.printf("Energy: %.1f | Mood: %.1f | Drift: %.1f\n", axisEnergy, axisMood, axisDrift);
             Serial.printf("Field: Traffic=%.2f Energy=%.2f\n", swarmTraffic, swarmEnergy);
+            Serial.println("\n--- GENETICS ---");
+            Serial.printf("GraphA=%d GraphB=%d | Bright=%d\n", genes.graphSourceA, genes.graphSourceB, genes.masterBrightness);
+            Serial.printf("Pins: HB=%d Bio=%d Sync=%d Data=%d\n", genes.pinHeartbeat, genes.pinBio, genes.pinSync, genes.pinData);
+        }
+        if (c == 'p') {
+            Serial.println("Enter: TargetID,ParamID,Value (e.g. 101,40,255 or 0,40,255 for all)");
+            while (!Serial.available()) delay(10);
+            
+            String input = Serial.readStringUntil('\n');
+            
+            // Parse 3 values: Target, Param, Value
+            int firstComma = input.indexOf(',');
+            int secondComma = input.indexOf(',', firstComma + 1);
+
+            if (firstComma > 0 && secondComma > 0) {
+                uint16_t targetId = input.substring(0, firstComma).toInt();
+                uint8_t paramId = input.substring(firstComma + 1, secondComma).toInt();
+                uint8_t value = input.substring(secondComma + 1).toInt();
+
+                // If I am the target (or if it's a broadcast), apply it locally first
+                if (targetId == 0 || targetId == swarmId) {
+                    setParameter(paramId, value);
+                }
+
+                // Broadcast to the swarm
+                SwarmMessage msg;
+                msg.header.msgType = MSG_PARAM;
+                msg.data.param.targetId = targetId; // Set the target
+                msg.data.param.paramId = paramId;
+                msg.data.param.value = value;
+                triggerBroadcast(MSG_PARAM, &msg);
+                
+                Serial.printf("📡 SENT Param: Target=%d ID=%d Val=%d\n", targetId, paramId, value);
+            } else {
+                Serial.println("❌ Invalid format. Use: Target,Param,Value");
+            }
         }
     }
 
@@ -1090,4 +1206,5 @@ void loop() {
         updateSwarmField();
         lastFieldUpdate = millis();
     }
+// FIXED: Moved closing brace to here, so updateSwarmField logic is INSIDE loop()
 }
