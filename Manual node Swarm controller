@@ -1,0 +1,131 @@
+#include <Arduino.h>
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEAdvertising.h>
+
+// ======================
+// 🎮 CONTROLLER CONFIG
+// ======================
+#define HIVE_MANUFACTURER_ID 0x00FF 
+#define CONTROLLER_ID 255  // Special ID for the Controller
+#define BUTTON_PIN 9       // Boot button on C3 SuperMini
+
+// ======================
+// 📜 SWARM PROTOCOL (Reduced)
+// ======================
+#define SWARM_PROTO_VERSION 4
+enum MsgType : uint8_t { MSG_PARAM = 7 };
+
+struct __attribute__((packed)) SwarmHeader {
+    uint8_t  version;       
+    uint8_t  msgType;       
+    uint16_t senderId;      
+    uint32_t bootToken;     
+    uint16_t sequenceId;    
+    uint8_t  groupId;       
+    uint8_t  context;       
+};
+
+struct __attribute__((packed)) MsgParam {
+    uint16_t targetId;  // 0 = ALL NODES
+    uint8_t paramId;
+    uint8_t value;
+};
+
+struct __attribute__((packed)) SwarmMessage {
+    SwarmHeader header;
+    MsgParam    param;
+};
+
+BLEAdvertising *pAdvertising;
+uint16_t sequenceCounter = 0;
+uint32_t bootToken;
+
+void setup() {
+    Serial.begin(115200);
+    pinMode(BUTTON_PIN, INPUT_PULLUP);
+    pinMode(8, OUTPUT); // Onboard LED usually on Pin 8 for C3 SuperMini (or 4/3 depending on board)
+
+    BLEDevice::init("HIVE_CTRL");
+    pAdvertising = BLEDevice::getAdvertising();
+    bootToken = esp_random();
+    
+    Serial.println("🎮 SWARM CONTROLLER ACTIVE");
+    Serial.println("Press BOOT button to cycle swarm modes.");
+}
+
+void broadcastParam(uint8_t paramId, uint8_t value) {
+    pAdvertising->stop();
+
+    SwarmMessage msg;
+    msg.header.version = SWARM_PROTO_VERSION;
+    msg.header.msgType = MSG_PARAM;
+    msg.header.senderId = CONTROLLER_ID;
+    msg.header.bootToken = bootToken;
+    msg.header.sequenceId = ++sequenceCounter;
+    msg.header.groupId = 0;
+    msg.header.context = 0;
+    
+    // 🎯 TARGET ID: 0 means EVERYONE
+    msg.param.targetId = 0; 
+    msg.param.paramId = paramId;
+    msg.param.value = value;
+
+    // Pack BLE Packet
+    uint8_t buffer[50];
+    uint16_t mfgId = HIVE_MANUFACTURER_ID;
+    buffer[0] = (uint8_t)(mfgId & 0xFF);
+    buffer[1] = (uint8_t)((mfgId >> 8) & 0xFF);
+    memcpy(&buffer[2], &msg, sizeof(SwarmHeader) + sizeof(MsgParam));
+
+    String mfgData = "";
+    for(size_t i=0; i < 2 + sizeof(SwarmHeader) + sizeof(MsgParam); i++) mfgData += (char)buffer[i];
+
+    BLEAdvertisementData oData = BLEAdvertisementData();
+    oData.setFlags(0x04);
+    oData.setManufacturerData(mfgData);
+    pAdvertising->setAdvertisementData(oData);
+    
+    // Burst fire for reliability
+    pAdvertising->start();
+    Serial.printf("📡 SENT: Param %d -> %d\n", paramId, value);
+    delay(500); // Transmit for 500ms
+    pAdvertising->stop();
+}
+
+int mode = 0;
+
+void loop() {
+    if (digitalRead(BUTTON_PIN) == LOW) {
+        delay(50); // Debounce
+        if (digitalRead(BUTTON_PIN) == LOW) {
+            mode++;
+            if (mode > 3) mode = 0;
+
+            switch(mode) {
+                case 0: 
+                    Serial.println("MODE: NORMAL");
+                    broadcastParam(40, 255); // Master Brightness MAX
+                    broadcastParam(52, 150); // Confusion Normal
+                    break;
+                case 1:
+                    Serial.println("MODE: STEALTH");
+                    broadcastParam(40, 40);  // Master Brightness DIM
+                    break;
+                case 2:
+                    Serial.println("MODE: CHAOS");
+                    broadcastParam(52, 0);   // Confusion Threshold 0 (Instant Chaos)
+                    broadcastParam(40, 255);
+                    break;
+                case 3:
+                    Serial.println("MODE: HIGH SENSITIVITY");
+                    broadcastParam(50, 255); // Drift Sensitivity MAX
+                    break;
+            }
+            
+            // Wait for button release
+            while(digitalRead(BUTTON_PIN) == LOW) delay(10);
+        }
+    }
+    delay(10);
+}
