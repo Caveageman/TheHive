@@ -1,0 +1,982 @@
+#include <Arduino.h>
+#include <FastLED.h>
+#include <Preferences.h>
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEScan.h>
+#include <BLEAdvertisedDevice.h>
+#include <BLEAdvertising.h>
+
+// ======================
+// 🛠️ HARDWARE CONFIG
+// ======================
+#define HIVE_MANUFACTURER_ID 0x00FF 
+
+#define LED_PIN 4
+#define MATRIX_WIDTH 16
+#define MATRIX_HEIGHT 16
+#define NUM_LEDS (MATRIX_WIDTH * MATRIX_HEIGHT)
+#define BRIGHTNESS 120
+
+#define LED_TYPE WS2812B
+#define COLOR_ORDER GRB
+
+CRGB leds[NUM_LEDS];
+Preferences prefs;
+
+// ======================
+// 📜 SWARM PROTOCOL V4
+// ======================
+#define SWARM_PROTO_VERSION 4
+
+enum MsgType : uint8_t {
+    MSG_HEARTBEAT   = 0,
+    MSG_ID_CLAIM    = 1,
+    MSG_ID_CONFLICT = 2,
+    MSG_SYNC        = 3,
+    MSG_EVENT       = 4,
+    MSG_STATE       = 5,
+    MSG_ANNOUNCE    = 6,
+    MSG_PARAM       = 7,
+};
+
+struct __attribute__((packed)) SwarmHeader {
+    uint8_t  version;       
+    uint8_t  msgType;       
+    uint16_t senderId;      
+    uint32_t bootToken;     
+    uint16_t sequenceId;    
+    uint8_t  groupId;       
+    uint8_t  context;       
+};
+
+struct __attribute__((packed)) MsgEvent {
+    uint8_t  eventId;       
+    uint8_t  intensity;     
+    uint16_t durationMs;    
+};
+
+struct __attribute__((packed)) MsgState {
+    int16_t  temp_x10;      
+    uint16_t humidity_x10;  
+    uint16_t traffic;       
+    uint8_t  energy;        
+    uint8_t  mood;          
+    uint8_t  cohesion;      
+    uint8_t  tempo;         
+    uint8_t  drift;         
+};
+
+struct __attribute__((packed)) MsgParam {
+    uint16_t targetId;
+    uint8_t paramId;
+    uint8_t value;
+};
+
+struct __attribute__((packed)) SwarmMessage {
+    SwarmHeader header;
+    union {
+        MsgEvent    event;
+        MsgState    state;
+        MsgParam    param;
+    } data;
+};
+
+// ======================
+// 🧠 GLOBAL STATE
+// ======================
+BLEAdvertising *pAdvertising;
+BLEScan *pBLEScan;
+
+uint32_t bootToken;
+uint16_t swarmId = 0;
+uint16_t mySequenceCounter = 0;
+
+// Matrix's Own Autonomic State
+float myEnergy = 180.0;
+float myMood = 128.0;
+float myTempo = 120.0;
+float myDrift = 10.0;
+
+// Swarm Collective State
+float avgEnergy = 128.0;
+float avgMood = 128.0;
+float avgTempo = 128.0;
+float avgDrift = 10.0;
+float avgTemp = 22.0;
+float avgHumidity = 50.0;
+
+// 🔥 FIXED: Proper node tracking
+uint16_t knownNodes[32];
+unsigned long nodeLastSeen[32];
+uint8_t nodeCount = 0;
+
+unsigned long lastHeardMs = 0;
+bool isBroadcasting = false;
+unsigned long broadcastStartTime = 0;
+unsigned long broadcastDuration = 150;
+
+// Visual Modes
+enum EventMode { MODE_NONE, MODE_BIO, MODE_CRASH, MODE_SATELLITE };
+EventMode currentEvent = MODE_NONE;
+unsigned long eventStartTime = 0;
+unsigned long eventDuration = 0;
+uint8_t eventIntensity = 0;
+
+// Data Activity
+struct DataBurst {
+    bool active;
+    unsigned long startTime;
+    uint8_t sourceX, sourceY;
+    uint8_t radius;
+};
+DataBurst txBurst = {false, 0, 8, 8, 0};
+DataBurst rxBurst = {false, 0, 8, 8, 0};
+
+// Bio Infection
+bool bioPixels[NUM_LEDS];
+int bioInfectedCount = 0;
+
+// 🔥 FIXED: Better satellite physics
+struct {
+    float x, y;
+    float vx, vy;
+    bool active;
+    unsigned long lastBounce;
+} satellite = {8.0, 8.0, 0.5, 0.3, false, 0};
+
+// ======================
+// 🗺️ XY MAPPING
+// ======================
+uint16_t XY(uint8_t x, uint8_t y) {
+    if (x >= MATRIX_WIDTH || y >= MATRIX_HEIGHT) return 0;
+    
+    // Serpentine/zigzag layout
+    if (y & 0x01) {
+        // Odd rows run backwards
+        uint8_t reverseX = (MATRIX_WIDTH - 1) - x;
+        return (y * MATRIX_WIDTH) + reverseX;
+    } else {
+        // Even rows run forwards
+        return (y * MATRIX_WIDTH) + x;
+    }
+}
+
+void setPixel(uint8_t x, uint8_t y, CRGB color) {
+    if (x < MATRIX_WIDTH && y < MATRIX_HEIGHT) {
+        leds[XY(x, y)] = color;
+    }
+}
+
+CRGB getPixel(uint8_t x, uint8_t y) {
+    if (x < MATRIX_WIDTH && y < MATRIX_HEIGHT) {
+        return leds[XY(x, y)];
+    }
+    return CRGB::Black;
+}
+
+// ======================
+// 📡 BLE FUNCTIONS
+// ======================
+void triggerBroadcast(MsgType type, SwarmMessage* msgOverride = nullptr) {
+    pBLEScan->stop(); 
+    pAdvertising->stop(); 
+
+    SwarmMessage outMsg;
+    
+    if (msgOverride) {
+        outMsg = *msgOverride; 
+    } else {
+        memset(&outMsg, 0, sizeof(SwarmMessage));
+    }
+
+    outMsg.header.version = SWARM_PROTO_VERSION;
+    outMsg.header.msgType = type;
+    outMsg.header.senderId = swarmId;
+    outMsg.header.bootToken = bootToken;
+    outMsg.header.sequenceId = ++mySequenceCounter;
+    outMsg.header.groupId = 0;
+    outMsg.header.context = 0;
+
+    if (type == MSG_STATE && !msgOverride) {
+        outMsg.data.state.temp_x10 = (int16_t)(avgTemp * 10);
+        outMsg.data.state.humidity_x10 = (uint16_t)(avgHumidity * 10);
+        outMsg.data.state.traffic = nodeCount; // 🔥 FIXED: Now reports actual node count
+        outMsg.data.state.energy = (uint8_t)myEnergy;
+        outMsg.data.state.mood = (uint8_t)myMood;
+        outMsg.data.state.cohesion = 128;
+        outMsg.data.state.tempo = (uint8_t)myTempo;
+        outMsg.data.state.drift = (uint8_t)myDrift;
+    }
+
+    size_t payloadSize = 0;
+    switch(type) {
+        case MSG_STATE: payloadSize = sizeof(MsgState); break;
+        case MSG_EVENT: payloadSize = sizeof(MsgEvent); break;
+        case MSG_PARAM: payloadSize = sizeof(MsgParam); break;
+        default: payloadSize = 0; break;
+    }
+
+    size_t totalLen = sizeof(SwarmHeader) + payloadSize;
+    uint8_t buffer[50];
+    uint16_t id = HIVE_MANUFACTURER_ID;
+    buffer[0] = (uint8_t)(id & 0xFF);
+    buffer[1] = (uint8_t)((id >> 8) & 0xFF);
+    memcpy(&buffer[2], &outMsg, totalLen);
+    
+    String mfgData = "";
+    for(size_t i=0; i < 2 + totalLen; i++) mfgData += (char)buffer[i];
+
+    BLEAdvertisementData oData = BLEAdvertisementData();
+    oData.setFlags(0x04);
+    oData.setManufacturerData(mfgData);
+    pAdvertising->setAdvertisementData(oData);
+    pAdvertising->setMinPreferred(0x20); 
+    pAdvertising->setMaxPreferred(0x20); 
+    
+    pAdvertising->start();
+    isBroadcasting = true;
+    broadcastStartTime = millis();
+    broadcastDuration = (type == MSG_EVENT || type == MSG_PARAM) ? 800 : 150;
+    
+    // Trigger TX burst
+    txBurst.active = true;
+    txBurst.startTime = millis();
+    txBurst.sourceX = 8;
+    txBurst.sourceY = 8;
+    txBurst.radius = 0;
+}
+
+void parseSwarmPacket(const uint8_t* rawData, int len, int rssi) {
+    SwarmMessage in;
+    if (len > sizeof(SwarmMessage)) len = sizeof(SwarmMessage);
+    memcpy(&in, rawData, len);
+
+    if (in.header.version != SWARM_PROTO_VERSION) return;
+    if (in.header.senderId == swarmId && in.header.bootToken == bootToken) return;
+    if (in.header.senderId >= 256) return;
+
+    lastHeardMs = millis();
+    
+    // 🔥 FIXED: Track unique nodes properly
+    bool foundNode = false;
+    for (uint8_t i = 0; i < nodeCount; i++) {
+        if (knownNodes[i] == in.header.senderId) {
+            nodeLastSeen[i] = millis();
+            foundNode = true;
+            break;
+        }
+    }
+    
+    if (!foundNode && nodeCount < 32) {
+        knownNodes[nodeCount] = in.header.senderId;
+        nodeLastSeen[nodeCount] = millis();
+        nodeCount++;
+        Serial.printf("✨ New node discovered: #%d (Total: %d)\n", in.header.senderId, nodeCount);
+    }
+    
+    // Trigger RX burst
+    rxBurst.active = true;
+    rxBurst.startTime = millis();
+    rxBurst.sourceX = random(0, MATRIX_WIDTH);
+    rxBurst.sourceY = random(0, MATRIX_HEIGHT);
+    rxBurst.radius = 0;
+
+    if (in.header.msgType == MSG_STATE) {
+        Serial.printf("[RX] #%d STATE | E:%d M:%d T:%d D:%d\n", 
+            in.header.senderId, 
+            in.data.state.energy, 
+            in.data.state.mood,
+            in.data.state.tempo,
+            in.data.state.drift);
+        
+        // Blend swarm state
+        float influence = 0.08;
+        avgEnergy = (avgEnergy * (1.0-influence)) + ((float)in.data.state.energy * influence);
+        avgMood   = (avgMood   * (1.0-influence)) + ((float)in.data.state.mood * influence);
+        avgTempo  = (avgTempo  * (1.0-influence)) + ((float)in.data.state.tempo * influence);
+        avgDrift  = (avgDrift  * (1.0-influence)) + ((float)in.data.state.drift * influence);
+        
+        float temp = in.data.state.temp_x10 / 10.0;
+        float hum = in.data.state.humidity_x10 / 10.0;
+        avgTemp = (avgTemp * 0.95) + (temp * 0.05);
+        avgHumidity = (avgHumidity * 0.95) + (hum * 0.05);
+        
+        // Influence own state
+        float myInfluence = 0.03;
+        myEnergy = (myEnergy * (1.0-myInfluence)) + (avgEnergy * myInfluence);
+        myMood   = (myMood   * (1.0-myInfluence)) + (avgMood * myInfluence);
+        myTempo  = (myTempo  * (1.0-myInfluence)) + (avgTempo * myInfluence);
+        myDrift  = (myDrift  * (1.0-myInfluence)) + (avgDrift * myInfluence);
+    }
+    
+    else if (in.header.msgType == MSG_EVENT) {
+        uint8_t evId = in.data.event.eventId;
+        Serial.printf("[RX] #%d EVENT | ID:%d Intensity:%d\n", 
+            in.header.senderId, evId, in.data.event.intensity);
+
+        if (evId == 5) { // BIO HAZARD
+            currentEvent = MODE_BIO;
+            eventStartTime = millis();
+            eventDuration = in.data.event.durationMs;
+            eventIntensity = in.data.event.intensity;
+            
+            // Seed initial infection
+            for (int i = 0; i < 10; i++) {
+                int idx = random(NUM_LEDS);
+                bioPixels[idx] = true;
+                bioInfectedCount++;
+            }
+            
+            myMood += 30.0;
+            if (myMood > 255) myMood = 255;
+        }
+        else if (evId == 1) { // CRASH
+            currentEvent = MODE_CRASH;
+            eventStartTime = millis();
+            eventDuration = in.data.event.durationMs;
+            eventIntensity = in.data.event.intensity;
+            
+            myEnergy -= 50.0;
+            if (myEnergy < 0) myEnergy = 0;
+            myDrift += 40.0;
+            if (myDrift > 255) myDrift = 255;
+        }
+        else if (evId == 2) { // SATELLITE
+            currentEvent = MODE_SATELLITE;
+            eventStartTime = millis();
+            eventDuration = in.data.event.durationMs;
+            eventIntensity = in.data.event.intensity;
+            
+            // 🔥 FIXED: Better initial conditions
+            satellite.active = true;
+            satellite.x = random(0, 2) ? 0 : MATRIX_WIDTH - 1; // Start from left or right edge
+            satellite.y = random(3, MATRIX_HEIGHT - 3);
+            satellite.vx = (satellite.x == 0) ? 0.4 : -0.4; // Move inward
+            satellite.vy = (random(0, 2) ? 0.2 : -0.2) + (random(-10, 10) / 100.0);
+            satellite.lastBounce = millis();
+            
+            myDrift -= 30.0;
+            if (myDrift < 0) myDrift = 0;
+        }
+    }
+}
+
+class MyAdvertisedDeviceCallbacks: public BLEAdvertisedDeviceCallbacks {
+    void onResult(BLEAdvertisedDevice advertisedDevice) {
+        if (advertisedDevice.haveManufacturerData()) {
+            String strData = advertisedDevice.getManufacturerData();
+            if (strData.length() >= 2 + sizeof(SwarmHeader)) {
+                const uint8_t *data = (const uint8_t*)strData.c_str();
+                uint16_t mfgID = data[0] | (data[1] << 8);
+                if (mfgID == HIVE_MANUFACTURER_ID) {
+                    parseSwarmPacket(&data[2], strData.length() - 2, advertisedDevice.getRSSI());
+                }
+            }
+        }
+    }
+};
+
+// ======================
+// 🎨 VISUAL EFFECTS
+// ======================
+
+// 🔥 FIXED: Much more interesting ambient field
+void renderAmbientField() {
+    static uint16_t noiseX = 0;
+    static uint16_t noiseY = 0;
+    static uint16_t noiseZ = 0;
+    static uint16_t noiseW = random16(); // Add 4th dimension for more variation
+    
+    // Speed controlled by tempo
+    uint16_t speed = map((long)myTempo, 0, 255, 10, 80);
+    noiseZ += speed;
+    noiseW += speed / 2;
+    
+    // Scale controlled by drift (more drift = larger patterns)
+    uint16_t scale = map((long)myDrift, 0, 255, 60, 15);
+    
+    // Base hue from mood
+    uint8_t baseHue = map((long)myMood, 0, 255, 160, 30);
+    
+    for (uint8_t y = 0; y < MATRIX_HEIGHT; y++) {
+        for (uint8_t x = 0; x < MATRIX_WIDTH; x++) {
+            // Generate two layers of noise for more complexity
+            uint16_t noise1 = inoise16(
+                noiseX + (x * scale),
+                noiseY + (y * scale),
+                noiseZ
+            );
+            
+            uint16_t noise2 = inoise16(
+                noiseX + (x * scale * 2),
+                noiseY + (y * scale * 2),
+                noiseW
+            );
+            
+            // Combine noise layers
+            uint8_t noiseVal1 = noise1 >> 8;
+            uint8_t noiseVal2 = noise2 >> 8;
+            
+            // Hue: base + large variation from noise
+            uint8_t hue = baseHue + (noiseVal1 / 2);
+            
+            // Brightness: energy-based with strong noise modulation
+            uint8_t baseBri = map((long)myEnergy, 0, 255, 20, 255);
+            uint8_t bri = scale8(baseBri, noiseVal2);
+            
+            // Add some "hot spots" where both noise values align
+            if (noiseVal1 > 200 && noiseVal2 > 200) {
+                bri = 255;
+            }
+            
+            // Saturation: varies with drift
+            uint8_t sat = 255;
+            if (myDrift > 150) {
+                // High drift = desaturated chaos
+                sat = map((long)myDrift, 150, 255, 255, 100);
+            }
+            
+            // Add secondary hue shift based on second noise layer
+            if (noiseVal2 > 220) {
+                hue += 30; // Accent colors
+            }
+            
+            setPixel(x, y, CHSV(hue, sat, bri));
+        }
+    }
+    
+    // Drift the noise field
+    noiseX += speed / 3;
+    noiseY += speed / 4;
+}
+
+// Temperature/Humidity Visualization Overlay
+void renderEnvironmentOverlay() {
+    // Map temperature to hue shift (20-30°C typical range)
+    int tempHue = map((long)(avgTemp * 10), 200, 300, 0, 255);
+    
+    // Map humidity to brightness pulses at edges
+    int humBrightness = map((long)avgHumidity, 30, 70, 50, 255);
+    
+    // Pulse edges based on humidity
+    if ((millis() / 1000) % 2 == 0) {
+        for (uint8_t i = 0; i < MATRIX_WIDTH; i++) {
+            leds[XY(i, 0)] += CHSV(tempHue, 200, humBrightness / 4);
+            leds[XY(i, MATRIX_HEIGHT-1)] += CHSV(tempHue, 200, humBrightness / 4);
+        }
+    }
+}
+
+// Data Burst Wave
+void renderDataBursts() {
+    if (txBurst.active) {
+        unsigned long elapsed = millis() - txBurst.startTime;
+        txBurst.radius = (elapsed / 15);
+        
+        if (txBurst.radius < 24) {
+            for (uint8_t y = 0; y < MATRIX_HEIGHT; y++) {
+                for (uint8_t x = 0; x < MATRIX_WIDTH; x++) {
+                    int dx = (int)x - (int)txBurst.sourceX;
+                    int dy = (int)y - (int)txBurst.sourceY;
+                    float dist = sqrt(dx*dx + dy*dy);
+                    
+                    if (abs(dist - txBurst.radius) < 2.0) {
+                        uint8_t fade = 255 - (txBurst.radius * 10);
+                        leds[XY(x, y)] += CHSV(96, 255, fade); // Green wave
+                    }
+                }
+            }
+        } else {
+            txBurst.active = false;
+        }
+    }
+    
+    if (rxBurst.active) {
+        unsigned long elapsed = millis() - rxBurst.startTime;
+        rxBurst.radius = (elapsed / 15);
+        
+        if (rxBurst.radius < 24) {
+            for (uint8_t y = 0; y < MATRIX_HEIGHT; y++) {
+                for (uint8_t x = 0; x < MATRIX_WIDTH; x++) {
+                    int dx = (int)x - (int)rxBurst.sourceX;
+                    int dy = (int)y - (int)rxBurst.sourceY;
+                    float dist = sqrt(dx*dx + dy*dy);
+                    
+                    if (abs(dist - rxBurst.radius) < 2.0) {
+                        uint8_t fade = 255 - (rxBurst.radius * 10);
+                        leds[XY(x, y)] += CHSV(160, 255, fade); // Blue wave
+                    }
+                }
+            }
+        } else {
+            rxBurst.active = false;
+        }
+    }
+}
+
+// 🔥 FIXED: Satellite with better physics
+void renderSatellite() {
+    if (!satellite.active) return;
+    
+    // Update position
+    satellite.x += satellite.vx;
+    satellite.y += satellite.vy;
+    
+    // 🔥 FIXED: Better bounce logic with anti-stuck mechanism
+    bool bounced = false;
+    
+    // X-axis bounce
+    if (satellite.x <= 1.0) {
+        satellite.x = 1.0;
+        satellite.vx = abs(satellite.vx); // Force positive
+        satellite.vx += 0.1; // Add energy
+        bounced = true;
+    } else if (satellite.x >= MATRIX_WIDTH - 2) {
+        satellite.x = MATRIX_WIDTH - 2;
+        satellite.vx = -abs(satellite.vx); // Force negative
+        satellite.vx -= 0.1; // Add energy
+        bounced = true;
+    }
+    
+    // Y-axis bounce
+    if (satellite.y <= 1.0) {
+        satellite.y = 1.0;
+        satellite.vy = abs(satellite.vy);
+        satellite.vy += 0.05;
+        bounced = true;
+    } else if (satellite.y >= MATRIX_HEIGHT - 2) {
+        satellite.y = MATRIX_HEIGHT - 2;
+        satellite.vy = -abs(satellite.vy);
+        satellite.vy -= 0.05;
+        bounced = true;
+    }
+    
+    // Add slight randomness on bounce to prevent loops
+    if (bounced && (millis() - satellite.lastBounce > 200)) {
+        satellite.vx += (random(-20, 20) / 100.0);
+        satellite.vy += (random(-20, 20) / 100.0);
+        satellite.lastBounce = millis();
+    }
+    
+    // Speed limits
+    satellite.vx = constrain(satellite.vx, -0.8, 0.8);
+    satellite.vy = constrain(satellite.vy, -0.8, 0.8);
+    
+    // Prevent stalling
+    if (abs(satellite.vx) < 0.2) satellite.vx = (satellite.vx > 0) ? 0.3 : -0.3;
+    if (abs(satellite.vy) < 0.15) satellite.vy = (satellite.vy > 0) ? 0.2 : -0.2;
+    
+    int cx = (int)satellite.x;
+    int cy = (int)satellite.y;
+    
+    // Amber blob
+    for (int dy = -4; dy <= 4; dy++) {
+        for (int dx = -4; dx <= 4; dx++) {
+            int x = cx + dx;
+            int y = cy + dy;
+            if (x >= 0 && x < MATRIX_WIDTH && y >= 0 && y < MATRIX_HEIGHT) {
+                float dist = sqrt(dx*dx + dy*dy);
+                if (dist < 4.5) {
+                    uint8_t bri = map((int)(dist * 100), 0, 450, 255, 30);
+                    leds[XY(x, y)] = CHSV(30, 255, bri); // Amber
+                }
+            }
+        }
+    }
+    
+    // Sparkly data transfer at center
+    for (int i = 0; i < 5; i++) {
+        if (random8() > 150) {
+            int sparkX = cx + random(-2, 3);
+            int sparkY = cy + random(-2, 3);
+            if (sparkX >= 0 && sparkX < MATRIX_WIDTH && sparkY >= 0 && sparkY < MATRIX_HEIGHT) {
+                leds[XY(sparkX, sparkY)] = CRGB::White;
+            }
+        }
+    }
+}
+
+// Bio Corruption
+void renderBio() {
+    unsigned long elapsed = millis() - eventStartTime;
+    float progress = (float)elapsed / (float)eventDuration;
+    
+    // Spread infection
+    if (random8() < map((int)(progress * 100), 0, 100, 10, 100)) {
+        // Pick a random infected pixel
+        int attempts = 20;
+        while (attempts-- > 0) {
+            int idx = random(NUM_LEDS);
+            if (bioPixels[idx]) {
+                // Infect a neighbor
+                int x = idx % MATRIX_WIDTH;
+                int y = idx / MATRIX_WIDTH;
+                int dx = random(-1, 2);
+                int dy = random(-1, 2);
+                int nx = x + dx;
+                int ny = y + dy;
+                if (nx >= 0 && nx < MATRIX_WIDTH && ny >= 0 && ny < MATRIX_HEIGHT) {
+                    int nidx = XY(nx, ny);
+                    if (!bioPixels[nidx]) {
+                        bioPixels[nidx] = true;
+                        bioInfectedCount++;
+                    }
+                }
+                break;
+            }
+        }
+    }
+    
+    // Render infected pixels
+    for (int i = 0; i < NUM_LEDS; i++) {
+        if (bioPixels[i]) {
+            int x = i % MATRIX_WIDTH;
+            int y = i / MATRIX_WIDTH;
+            
+            // Green corruption with random glitches
+            uint8_t hue = 96;
+            uint8_t sat = 255;
+            uint8_t val = random8(150, 255);
+            
+            if (random8() < 20) { // Random white glitch
+                sat = 0;
+                val = 255;
+            }
+            
+            leds[XY(x, y)] = CHSV(hue, sat, val);
+            
+            // Slowly "kill" the pixel
+            if (progress > 0.5 && random8() < 50) {
+                leds[XY(x, y)].fadeToBlackBy(random8(100, 200));
+            }
+        }
+    }
+    
+    // Clear at end
+    if (elapsed > eventDuration) {
+        currentEvent = MODE_NONE;
+        memset(bioPixels, 0, sizeof(bioPixels));
+        bioInfectedCount = 0;
+    }
+}
+
+// Crash Sequence
+void renderCrash() {
+    unsigned long elapsed = millis() - eventStartTime;
+    float progress = (float)elapsed / (float)eventDuration;
+    
+    if (progress < 0.30) {
+        // Chaos phase - random glitches
+        for (int i = 0; i < 20; i++) {
+            int idx = random(NUM_LEDS);
+            CRGB glitchColor;
+            int r = random8();
+            if (r < 60) glitchColor = CRGB::Red;
+            else if (r < 120) glitchColor = CRGB::Cyan;
+            else if (r < 180) glitchColor = CRGB::Magenta;
+            else glitchColor = CRGB::White;
+            leds[idx] = glitchColor;
+        }
+        fadeToBlackBy(leds, NUM_LEDS, 50);
+    }
+    else if (progress < 0.70) {
+        // Death from center
+        float deathProgress = (progress - 0.30) / 0.40;
+        float deathRadius = deathProgress * 12.0;
+        
+        for (uint8_t y = 0; y < MATRIX_HEIGHT; y++) {
+            for (uint8_t x = 0; x < MATRIX_WIDTH; x++) {
+                int dx = (int)x - 8;
+                int dy = (int)y - 8;
+                float dist = sqrt(dx*dx + dy*dy);
+                
+                if (dist < deathRadius) {
+                    leds[XY(x, y)] = CRGB::Black;
+                } else if (dist < deathRadius + 2) {
+                    // Edge of death
+                    leds[XY(x, y)] = CRGB::DarkRed;
+                }
+            }
+        }
+    }
+    else {
+        // Reboot sequence
+        float bootProgress = (progress - 0.70) / 0.30;
+        
+        // Spinning rainbow boot
+        int revolutions = bootProgress * 30;
+        int angle = (revolutions * 360) % 360;
+        
+        for (uint8_t y = 0; y < MATRIX_HEIGHT; y++) {
+            for (uint8_t x = 0; x < MATRIX_WIDTH; x++) {
+                int dx = (int)x - 8;
+                int dy = (int)y - 8;
+                float pixelAngle = atan2(dy, dx) * 180 / PI;
+                if (pixelAngle < 0) pixelAngle += 360;
+                
+                if (abs(pixelAngle - angle) < 30) {
+                    uint8_t hue = (revolutions * 10) % 255;
+                    leds[XY(x, y)] = CHSV(hue, 255, 255);
+                }
+            }
+        }
+        fadeToBlackBy(leds, NUM_LEDS, 30);
+    }
+    
+    if (elapsed > eventDuration) {
+        currentEvent = MODE_NONE;
+        myEnergy = 50; // Partial recovery
+    }
+}
+
+// ======================
+// 🧠 AUTONOMIC UPDATE
+// ======================
+void updateMatrixAutonomics() {
+    bool isolated = (millis() - lastHeardMs) > 5000;
+    
+    // 🔥 FIXED: Expire old nodes (not heard from in 10 seconds)
+    for (uint8_t i = 0; i < nodeCount; i++) {
+        if (millis() - nodeLastSeen[i] > 10000) {
+            Serial.printf("💀 Node #%d expired (timeout)\n", knownNodes[i]);
+            // Remove this node
+            for (uint8_t j = i; j < nodeCount - 1; j++) {
+                knownNodes[j] = knownNodes[j + 1];
+                nodeLastSeen[j] = nodeLastSeen[j + 1];
+            }
+            nodeCount--;
+            i--; // Recheck this index
+        }
+    }
+    
+    // Energy decay
+    myEnergy -= isolated ? 1.0 : 0.3;
+    if (myDrift > 220) myEnergy -= 10.0;
+    myEnergy = constrain(myEnergy, 0.0, 255.0);
+    
+    // Drift accumulation
+    myDrift += isolated ? 0.8 : 0.0;
+    myDrift += 0.01;
+    if (myEnergy < 80 && !isolated) myDrift -= 1.0;
+    myDrift = constrain(myDrift, 0.0, 255.0);
+    
+    // Mood volatility
+    int volatility = 5;
+    if (myEnergy > 200) volatility = 12;
+    if (myDrift > 150) volatility = 18;
+    myMood += random(-volatility, volatility + 1);
+    myMood = constrain(myMood, 0.0, 255.0);
+    
+    // Tempo
+    float targetTempo;
+    if (myDrift > 180) {
+        targetTempo = random(40, 220);
+    } else {
+        targetTempo = map((long)myEnergy, 0, 255, 50, 230);
+    }
+    myTempo += (targetTempo - myTempo) * 0.08;
+    myTempo = constrain(myTempo, 0.0, 255.0);
+}
+
+// ======================
+// 🚀 SETUP & LOOP
+// ======================
+void runBootSequence() {
+    Serial.println("🌌 Matrix Boot Sequence");
+    
+    // Spiral out from center
+    for (int r = 0; r < 12; r++) {
+        for (int angle = 0; angle < 360; angle += 15) {
+            float rad = angle * PI / 180.0;
+            int x = 8 + (int)(r * cos(rad));
+            int y = 8 + (int)(r * sin(rad));
+            if (x >= 0 && x < MATRIX_WIDTH && y >= 0 && y < MATRIX_HEIGHT) {
+                setPixel(x, y, CHSV((r * 20) % 255, 255, 255));
+            }
+        }
+        FastLED.show();
+        delay(40);
+        fadeToBlackBy(leds, NUM_LEDS, 100);
+    }
+    
+    // Flash white
+    fill_solid(leds, NUM_LEDS, CRGB::White);
+    FastLED.show();
+    delay(200);
+    
+    // Fade out
+    for (int i = 255; i > 0; i -= 10) {
+        fadeToBlackBy(leds, NUM_LEDS, 10);
+        FastLED.show();
+        delay(10);
+    }
+}
+
+void setup() {
+    Serial.begin(115200);
+    
+    FastLED.addLeds<LED_TYPE, LED_PIN, COLOR_ORDER>(leds, NUM_LEDS);
+    FastLED.setBrightness(BRIGHTNESS);
+    FastLED.clear();
+    
+    prefs.begin("matrix", false);
+    swarmId = prefs.getUShort("swarmId", 0);
+    if (swarmId == 0) {
+        swarmId = (uint16_t)random(200, 254); // Higher range for matrix nodes
+        prefs.putUShort("swarmId", swarmId);
+    }
+    prefs.end();
+    
+    bootToken = esp_random();
+    memset(bioPixels, 0, sizeof(bioPixels));
+    memset(knownNodes, 0, sizeof(knownNodes));
+    memset(nodeLastSeen, 0, sizeof(nodeLastSeen));
+    
+    runBootSequence();
+    
+    BLEDevice::init("");
+    pAdvertising = BLEDevice::getAdvertising();
+    pBLEScan = BLEDevice::getScan();
+    pBLEScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
+    pBLEScan->setActiveScan(true);
+    pBLEScan->setInterval(40);
+    pBLEScan->setWindow(40);
+    pBLEScan->start(0, nullptr);
+    
+    Serial.printf("🌌 Matrix Node #%d Online\n", swarmId);
+}
+
+void loop() {
+    unsigned long now = millis();
+    
+    // BLE broadcast management
+    if (isBroadcasting && (now - broadcastStartTime > broadcastDuration)) {
+        isBroadcasting = false;
+        pAdvertising->stop();
+        pBLEScan->clearResults();
+        pBLEScan->start(0, nullptr);
+    }
+    
+    // Autonomic update (every 500ms)
+    static unsigned long lastAutonomic = 0;
+    if (now - lastAutonomic > 500) {
+        updateMatrixAutonomics();
+        lastAutonomic = now;
+    }
+    
+    // Heartbeat broadcast (tempo-driven)
+    static unsigned long lastBroadcast = 0;
+    long broadcastInterval = map((long)myTempo, 0, 255, 4000, 500);
+    if (now - lastBroadcast > broadcastInterval) {
+        triggerBroadcast(MSG_STATE);
+        lastBroadcast = now;
+        Serial.printf("[TX] E:%d M:%d T:%d D:%d | Swarm:%d nodes\n",
+            (int)myEnergy, (int)myMood, (int)myTempo, (int)myDrift, nodeCount);
+    }
+    
+    // === RENDER PIPELINE ===
+    
+    // 1. Base ambient field
+    renderAmbientField();
+    
+    // 2. Environment overlay
+    renderEnvironmentOverlay();
+    
+    // 3. Data bursts
+    renderDataBursts();
+    
+    // 4. Event overlays
+    switch (currentEvent) {
+        case MODE_SATELLITE:
+            renderSatellite();
+            if (millis() - eventStartTime > eventDuration) {
+                currentEvent = MODE_NONE;
+                satellite.active = false;
+            }
+            break;
+        case MODE_BIO:
+            renderBio();
+            break;
+        case MODE_CRASH:
+            renderCrash();
+            break;
+        default:
+            break;
+    }
+    
+    FastLED.show();
+    delay(20);
+    
+    // Serial commands
+    if (Serial.available()) {
+        char c = Serial.read();
+        if (c == '?') {
+            Serial.println("\n--- MATRIX STATUS ---");
+            Serial.printf("ID: %d\n", swarmId);
+            Serial.printf("MY: E:%.1f M:%.1f T:%.1f D:%.1f\n",
+                myEnergy, myMood, myTempo, myDrift);
+            Serial.printf("SWARM: E:%.1f M:%.1f T:%.1f D:%.1f\n",
+                avgEnergy, avgMood, avgTempo, avgDrift);
+            Serial.printf("ENV: Temp:%.1f°C Hum:%.1f%% Nodes:%d\n",
+                avgTemp, avgHumidity, nodeCount);
+            Serial.printf("Event: %d | Sat Active: %d\n", currentEvent, satellite.active);
+            Serial.print("Known Nodes: ");
+            for (uint8_t i = 0; i < nodeCount; i++) {
+                Serial.printf("#%d ", knownNodes[i]);
+            }
+            Serial.println();
+        }
+        else if (c == 'c') {
+            // Test crash
+            currentEvent = MODE_CRASH;
+            eventStartTime = millis();
+            eventDuration = 8000;
+            
+            SwarmMessage msg;
+            msg.header.msgType = MSG_EVENT;
+            msg.data.event.eventId = 1;
+            msg.data.event.intensity = 200;
+            msg.data.event.durationMs = 8000;
+            triggerBroadcast(MSG_EVENT, &msg);
+        }
+        else if (c == 's') {
+            // Test satellite
+            currentEvent = MODE_SATELLITE;
+            eventStartTime = millis();
+            eventDuration = 15000;
+            satellite.active = true;
+            satellite.x = 0;
+            satellite.y = 8;
+            satellite.vx = 0.5;
+            satellite.vy = 0.3;
+            
+            SwarmMessage msg;
+            msg.header.msgType = MSG_EVENT;
+            msg.data.event.eventId = 2;
+            msg.data.event.intensity = 255;
+            msg.data.event.durationMs = 15000;
+            triggerBroadcast(MSG_EVENT, &msg);
+        }
+        else if (c == 'b') {
+            // Test bio
+            currentEvent = MODE_BIO;
+            eventStartTime = millis();
+            eventDuration = 20000;
+            memset(bioPixels, 0, sizeof(bioPixels));
+            for (int i = 0; i < 5; i++) {
+                bioPixels[random(NUM_LEDS)] = true;
+            }
+            
+            SwarmMessage msg;
+            msg.header.msgType = MSG_EVENT;
+            msg.data.event.eventId = 5;
+            msg.data.event.intensity = 200;
+            msg.data.event.durationMs = 20000;
+            triggerBroadcast(MSG_EVENT, &msg);
+        }
+        else if (c == 'r') {
+            runBootSequence();
+        }
+    }
+}
